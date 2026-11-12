@@ -14,8 +14,12 @@
  * limitations under the License.
  */
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Injector, ThemeService } from '@univerjs/core';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { UniverPrintingContext, UniverRenderingContext2D } from '../context';
+import { CanvasColorService, ICanvasColorService } from '../services/canvas-color.service';
+
+let injector: Injector;
 
 function createNativeContext() {
     const canvas = document.createElement('canvas');
@@ -107,11 +111,19 @@ function createNativeContext() {
 }
 
 describe('canvas context', () => {
+    beforeEach(() => {
+        injector = new Injector([[ThemeService], [ICanvasColorService, { useClass: CanvasColorService }]]);
+    });
+
+    afterEach(() => injector.dispose());
+
     afterEach(() => vi.restoreAllMocks());
 
     it('reuses scale during a drawing scope without sharing mutable public transform snapshots', () => {
         const native = createNativeContext();
-        const ctx = new UniverRenderingContext2D(native);
+        const ctx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, native);
+        } }]]).get(UniverRenderingContext2D);
         ctx.withCachedScale(() => {
             expect(ctx.getScale()).toEqual({ scaleX: 2, scaleY: 4 });
             ctx.moveToByPrecision(1.2, 2.3);
@@ -141,7 +153,9 @@ describe('canvas context', () => {
         (ctx: UniverRenderingContext2D) => ctx.translateWithPrecisionRatio(2, 3),
     ])('refreshes scoped scale after a context transformation (%#)', (transform) => {
         const native = createNativeContext();
-        const ctx = new UniverRenderingContext2D(native);
+        const ctx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, native);
+        } }]]).get(UniverRenderingContext2D);
         ctx.withCachedScale(() => {
             expect(ctx.getScale()).toEqual({ scaleX: 2, scaleY: 4 });
             vi.mocked(native.getTransform).mockReturnValue({ a: 0, b: 3, c: 5, d: 0 } as DOMMatrix);
@@ -152,7 +166,9 @@ describe('canvas context', () => {
 
     it('clears nested and failed drawing scopes and leaves ordinary scale reads live', () => {
         const native = createNativeContext();
-        const ctx = new UniverRenderingContext2D(native);
+        const ctx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, native);
+        } }]]).get(UniverRenderingContext2D);
         ctx.withCachedScale(() => {
             expect(ctx.getScale().scaleX).toBe(2);
             expect(() => ctx.withCachedScale(() => {
@@ -177,20 +193,21 @@ describe('canvas context', () => {
 
     it('forwards style and basic drawing calls', () => {
         const nativeCtx = createNativeContext();
-        const renderCtx = new UniverRenderingContext2D(nativeCtx, {
-            canvasColorService: {
-                getRenderColor: (color: string) => `render-${color}`,
-            } as any,
-        });
+        const renderCtx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, nativeCtx, {
+                canvasColorService: injector.get(ICanvasColorService),
+            });
+        } }]]).get(UniverRenderingContext2D);
 
         renderCtx.setId('ctx-id');
         expect(renderCtx.getId()).toBe('ctx-id');
         expect(renderCtx.isContextLost()).toBe(false);
 
-        renderCtx.fillStyle = '#111111';
-        renderCtx.strokeStyle = '#222222';
-        expect(nativeCtx.fillStyle).toBe('render-#111111');
-        expect(nativeCtx.strokeStyle).toBe('render-#222222');
+        renderCtx.fillStyle = 'primary.500';
+        renderCtx.strokeStyle = 'gray.700';
+        const theme = injector.get(ThemeService).getCurrentTheme();
+        expect(nativeCtx.fillStyle).toBe(theme.primary[500]);
+        expect(nativeCtx.strokeStyle).toBe(theme.gray[700]);
 
         renderCtx.globalAlpha = 0.7;
         renderCtx.globalCompositeOperation = 'multiply';
@@ -256,7 +273,9 @@ describe('canvas context', () => {
 
     it('covers precision, drawImage, createImageData and env branches', () => {
         const nativeCtx = createNativeContext();
-        const renderCtx = new UniverRenderingContext2D(nativeCtx);
+        const renderCtx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, nativeCtx);
+        } }]]).get(UniverRenderingContext2D);
 
         renderCtx.roundRectByPrecision(1, 2, 3, 4, 2);
         renderCtx.arcByPrecision(1, 2, 5, 0, Math.PI);
@@ -292,13 +311,17 @@ describe('canvas context', () => {
         renderCtx.closePathByEnv();
         expect(nativeCtx.closePath).not.toHaveBeenCalled();
         userAgentSpy.mockReturnValue('Mozilla/5.0 (Macintosh; Intel Mac OS X) Gecko/20100101 Firefox/130.0');
-        new UniverRenderingContext2D(nativeCtx).closePathByEnv();
+        injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, nativeCtx);
+        } }]]).get(UniverRenderingContext2D).closePathByEnv();
         expect(nativeCtx.closePath).toHaveBeenCalledTimes(1);
     });
 
     it('forwards text language in both directions', () => {
         const nativeCtx = createNativeContext();
-        const renderCtx = new UniverRenderingContext2D(nativeCtx);
+        const renderCtx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, nativeCtx);
+        } }]]).get(UniverRenderingContext2D);
 
         nativeCtx.lang = 'ja';
         expect(renderCtx.lang).toBe('ja');
@@ -310,7 +333,9 @@ describe('canvas context', () => {
     it('inherits text language when the native context has no language property', () => {
         const nativeCtx = createNativeContext();
         delete (nativeCtx as Partial<CanvasRenderingContext2D>).lang;
-        const renderCtx = new UniverRenderingContext2D(nativeCtx);
+        const renderCtx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, nativeCtx);
+        } }]]).get(UniverRenderingContext2D);
 
         expect(renderCtx.lang).toBe('inherit');
 
@@ -325,7 +350,9 @@ describe('canvas context', () => {
     ])('draws rounded corners with radius $radius without native roundRect on Chrome 88', ({ radius, expectedRadius }) => {
         const nativeCtx = createNativeContext();
         delete (nativeCtx as Partial<CanvasRenderingContext2D>).roundRect;
-        const renderCtx = new UniverRenderingContext2D(nativeCtx);
+        const renderCtx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, nativeCtx);
+        } }]]).get(UniverRenderingContext2D);
 
         renderCtx.roundRect(10, 20, 40, 20, radius);
 
@@ -342,7 +369,9 @@ describe('canvas context', () => {
     it.each([undefined, 0])('draws a rectangle with radius %s without native roundRect on Chrome 88', (radius) => {
         const nativeCtx = createNativeContext();
         delete (nativeCtx as Partial<CanvasRenderingContext2D>).roundRect;
-        const renderCtx = new UniverRenderingContext2D(nativeCtx);
+        const renderCtx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, nativeCtx);
+        } }]]).get(UniverRenderingContext2D);
 
         renderCtx.roundRect(10, 20, 40, 20, radius);
 
@@ -352,7 +381,9 @@ describe('canvas context', () => {
 
     it('forwards native rounded rectangles and line dashes', () => {
         const nativeCtx = createNativeContext();
-        const renderCtx = new UniverRenderingContext2D(nativeCtx);
+        const renderCtx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, nativeCtx);
+        } }]]).get(UniverRenderingContext2D);
         const radii = [{ x: 4, y: 2 }, 8];
 
         renderCtx.roundRect(10, 20, 40, 20, radii);
@@ -364,7 +395,9 @@ describe('canvas context', () => {
 
     it('clears the printing context without changing its compositing mode', () => {
         const nativeCtx = createNativeContext();
-        const printingCtx = new UniverPrintingContext(nativeCtx);
+        const printingCtx = injector.createChild([[UniverPrintingContext, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverPrintingContext, nativeCtx);
+        } }]]).get(UniverPrintingContext);
         printingCtx.clearRect(1, 2, 3, 4);
         printingCtx.clearRectForTexture(1, 2, 3, 4);
         printingCtx.setGlobalCompositeOperation('lighter');
@@ -378,7 +411,9 @@ describe('canvas context', () => {
 
     it('reads proxied state and helper factories from the native context', () => {
         const nativeCtx = createNativeContext();
-        const renderCtx = new UniverRenderingContext2D(nativeCtx);
+        const renderCtx = injector.createChild([[UniverRenderingContext2D, { useFactory: function createTestInstance() {
+            return injector.createInstance(UniverRenderingContext2D, nativeCtx);
+        } }]]).get(UniverRenderingContext2D);
 
         expect(renderCtx.globalAlpha).toBe(1);
         expect(renderCtx.globalCompositeOperation).toBe('source-over');

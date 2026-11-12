@@ -15,16 +15,19 @@
  */
 
 import { Injector } from '@univerjs/core';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { IViewportInfo } from '../basics/vector2';
 import { BaseObject } from '../base-object';
 import { RENDER_CLASS_TYPE } from '../basics/const';
 import { Engine } from '../engine';
 import { Layer } from '../layer';
 import { MAIN_VIEW_PORT_KEY, Scene } from '../scene';
+import { SceneViewer } from '../scene-viewer';
 import { DumbCanvasColorService, ICanvasColorService } from '../services/canvas-color.service';
 import { Rect } from '../shape/rect';
 import { Viewport } from '../viewport';
+
+let injector: Injector;
 
 class TestObject extends BaseObject {
     constructor(id: string, zIndex = 1) {
@@ -52,59 +55,52 @@ class TestGroup extends TestObject {
 }
 
 function createScene() {
-    let transformCallback: (() => void) | undefined;
-    const sceneViewer = {
-        classType: RENDER_CLASS_TYPE.SCENE_VIEWER,
-        makeDirty: vi.fn(),
-    };
-    const viewport = {
-        viewportKey: 'viewport',
-        shouldIntoRender: vi.fn(() => true),
-        render: vi.fn(),
-    };
-    const engine = {
+    injector.add([Engine, {
+        useFactory: function createTestInstance() {
+            return injector.createInstance(Engine, 'layer-engine', { elementWidth: 160, elementHeight: 90, dpr: 1 });
+        },
+    }]);
+    const engine = injector.get(Engine);
+    const rootScene = injector.createInstance(Scene, 'root-layer-scene', engine);
+    const viewer = injector.createInstance(SceneViewer, 'layer-viewer', { width: 320, height: 180 });
+    rootScene.addObject(viewer);
+    const scene = injector.createInstance(Scene, 'layer-scene', viewer);
+    scene.transformByState({ width: 320, height: 180, scaleX: 1, scaleY: 1 });
+    const viewport = injector.createInstance(Viewport, 'viewport', scene, {
+        left: 0,
+        top: 0,
         width: 160,
         height: 90,
-        canvasColorService: undefined,
-        onTransformChange$: {
-            subscribeEvent: vi.fn((callback: () => void) => {
-                transformCallback = callback;
-                return { dispose: vi.fn() };
-            }),
-        },
-    };
-    const scene = {
-        getParent: vi.fn(() => sceneViewer),
-        getEngine: vi.fn(() => engine),
-        getObject: vi.fn(() => null),
-        setObjectBehavior: vi.fn(),
-        getViewports: vi.fn(() => [viewport]),
+        active: true,
+    });
+    vi.spyOn(scene, 'setObjectBehavior');
+    vi.spyOn(viewer, 'makeDirty');
+    vi.spyOn(viewport, 'render');
+    return Object.assign(scene, {
         __viewport: viewport,
-        __sceneViewer: sceneViewer,
-        __resizeCache: () => transformCallback?.(),
-    };
-
-    return scene as any;
+        __sceneViewer: viewer,
+        __resizeCache: () => {
+            engine.resizeBySize(161, 91);
+            engine.resizeBySize(160, 90);
+        },
+    });
 }
 
 function createCtx() {
-    const canvas = document.createElement('canvas');
-    const transform = document.createElement('canvas').getContext('2d')!.getTransform();
-    return {
-        canvas,
-        save: vi.fn(),
-        restore: vi.fn(),
-        beginPath: vi.fn(),
-        rect: vi.fn(),
-        clip: vi.fn(),
-        clearRect: vi.fn(),
-        setTransform: vi.fn(),
-        getTransform: vi.fn(() => transform),
-        drawImage: vi.fn(),
-    } as any;
+    const ctx = injector.get(Engine).getCanvas().getContext();
+    for (const method of ['save', 'restore', 'beginPath', 'rect', 'clip', 'clearRect', 'setTransform', 'getTransform', 'drawImage'] as const) {
+        vi.spyOn(ctx, method);
+    }
+    return ctx;
 }
 
 describe('layer', () => {
+    beforeEach(() => {
+        injector = new Injector([[ICanvasColorService, { useClass: DumbCanvasColorService }]]);
+    });
+
+    afterEach(() => injector.dispose());
+
     it('paints a cache enabled after engine sizing and invalidates it for edits and resize', () => {
         const injector = new Injector([
             [ICanvasColorService, { useClass: DumbCanvasColorService }],
@@ -164,13 +160,21 @@ describe('layer', () => {
 
     it('adds, orders, filters and removes regular objects', () => {
         const scene = createScene();
-        const visible = new TestObject('visible', 2);
-        const hidden = new TestObject('hidden', 1);
-        const eventless = new TestObject('eventless', 3);
+        const visible = injector.createChild([[TestObject, { useFactory: function createTestInstance() {
+            return injector.createInstance(TestObject, 'visible', 2);
+        } }]]).get(TestObject);
+        const hidden = injector.createChild([[TestObject, { useFactory: function createTestInstance() {
+            return injector.createInstance(TestObject, 'hidden', 1);
+        } }]]).get(TestObject);
+        const eventless = injector.createChild([[TestObject, { useFactory: function createTestInstance() {
+            return injector.createInstance(TestObject, 'eventless', 3);
+        } }]]).get(TestObject);
         hidden.hide();
         eventless.evented = false;
 
-        const layer = new Layer(scene, [visible, hidden, eventless], 4);
+        const layer = injector.createChild([[Layer, { useFactory: function createTestInstance() {
+            return injector.createInstance(Layer, scene, [visible, hidden, eventless], 4);
+        } }]]).get(Layer);
 
         expect(layer.scene).toBe(scene);
         expect(layer.zIndex).toBe(4);
@@ -191,11 +195,19 @@ describe('layer', () => {
 
     it('expands groups, renders through viewports and updates dirty state', async () => {
         const scene = createScene();
-        const child = new TestObject('child', 1);
-        const duplicateChild = new TestObject('duplicate-child', 2);
-        scene.getObject = vi.fn((key: string) => key === 'duplicate-child' ? duplicateChild : null);
-        const group = new TestGroup('group', [child, duplicateChild]);
-        const layer = new Layer(scene, [], 1);
+        const child = injector.createChild([[TestObject, { useFactory: function createTestInstance() {
+            return injector.createInstance(TestObject, 'child', 1);
+        } }]]).get(TestObject);
+        const duplicateChild = injector.createChild([[TestObject, { useFactory: function createTestInstance() {
+            return injector.createInstance(TestObject, 'duplicate-child', 2);
+        } }]]).get(TestObject);
+        scene.addObject(duplicateChild, 2);
+        const group = injector.createChild([[TestGroup, { useFactory: function createTestInstance() {
+            return injector.createInstance(TestGroup, 'group', [child, duplicateChild]);
+        } }]]).get(TestGroup);
+        const layer = injector.createChild([[Layer, { useFactory: function createTestInstance() {
+            return injector.createInstance(Layer, scene, [], 1);
+        } }]]).get(Layer);
 
         layer.addObject(group);
         expect(layer.getObjects().map((object) => object.oKey)).toEqual(['child', 'group']);
@@ -222,10 +234,14 @@ describe('layer', () => {
 
     it('clips scroll repaint and refreshes the stale layer cache before reuse', () => {
         const scene = createScene();
-        const object = new TestObject('cached', 1);
-        const layer = new Layer(scene, [object], 1, true);
+        const object = injector.createChild([[TestObject, { useFactory: function createTestInstance() {
+            return injector.createInstance(TestObject, 'cached', 1);
+        } }]]).get(TestObject);
+        const layer = injector.createChild([[Layer, { useFactory: function createTestInstance() {
+            return injector.createInstance(Layer, scene, [object], 1, true);
+        } }]]).get(Layer);
         const ctx = createCtx();
-        const viewportInfo = { viewportKey: 'viewport' } as IViewportInfo;
+        const viewportInfo = scene.__viewport.calcViewportInfo();
         const dirtyBounds = [{ left: 140, top: 0, right: 160, bottom: 90 }];
 
         scene.__resizeCache();
@@ -238,7 +254,7 @@ describe('layer', () => {
         expect(ctx.rect).toHaveBeenCalledWith(140, 0, 20, 90);
         expect(ctx.drawImage).not.toHaveBeenCalled();
 
-        scene.__viewport.render.mockClear();
+        vi.mocked(scene.__viewport.render).mockClear();
         layer.render(ctx);
         expect(scene.__viewport.render).toHaveBeenCalledWith(expect.anything(), [object], false, undefined);
         expect(ctx.drawImage).toHaveBeenCalledWith(expect.any(HTMLCanvasElement), 0, 0, 160, 90);
@@ -248,8 +264,12 @@ describe('layer', () => {
 
     it('uses cache canvas rendering, resizing and disposal paths', () => {
         const scene = createScene();
-        const object = new TestObject('cached', 1);
-        const layer = new Layer(scene, [object], 1, true);
+        const object = injector.createChild([[TestObject, { useFactory: function createTestInstance() {
+            return injector.createInstance(TestObject, 'cached', 1);
+        } }]]).get(TestObject);
+        const layer = injector.createChild([[Layer, { useFactory: function createTestInstance() {
+            return injector.createInstance(Layer, scene, [object], 1, true);
+        } }]]).get(Layer);
         const ctx = createCtx();
 
         expect(layer.isAllowCache()).toBe(true);
