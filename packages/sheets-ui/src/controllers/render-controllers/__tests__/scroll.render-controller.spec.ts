@@ -14,13 +14,20 @@
  * limitations under the License.
  */
 
-import { CommandType, FOCUSING_SHEET, ICommandService } from '@univerjs/core';
-import { RENDER_CLASS_TYPE, SHEET_VIEWPORT_KEY } from '@univerjs/engine-render';
+import type { IWheelEvent } from '@univerjs/engine-render';
+import { CommandType, Direction, FOCUSING_SHEET, ICommandService, LocaleType } from '@univerjs/core';
+import { IRenderManagerService, RENDER_CLASS_TYPE, SHEET_VIEWPORT_KEY } from '@univerjs/engine-render';
+import { SetSelectionsOperation } from '@univerjs/sheets';
 import { Subject } from 'rxjs';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import type { IFakeEngine } from './render-test-bed';
 import { ScrollCommand, SetScrollRelativeCommand } from '../../../commands/commands/set-scroll.command';
+import { ExpandSelectionCommand } from '../../../commands/commands/set-selection.command';
+import { SetScrollOperation } from '../../../commands/operations/scroll.operation';
 import { SheetScrollManagerService } from '../../../services/scroll-manager.service';
+import { SheetSelectionRenderService } from '../../../services/selection/selection-render.service';
 import { SheetsScrollRenderController } from '../scroll.render-controller';
+import { createChartRenderTestBed } from './chart-render-test-bed';
 import { createRenderTestBed } from './render-test-bed';
 
 function createScrollManagerServiceMock() {
@@ -47,7 +54,12 @@ function createScrollManagerServiceMock() {
 
 let pendingAnimationFrames: FrameRequestCallback[] = [];
 
-function flushWheelFrame() {
+function flushWheelFrame(scene: ReturnType<typeof createRenderTestBed>['scene']) {
+    const engine = scene.getEngine() as IFakeEngine;
+    if (engine.beginFrame$) {
+        engine.runRenderLoop(() => {});
+        return;
+    }
     const callback = pendingAnimationFrames.shift();
     expect(callback).toBeDefined();
     callback!(performance.now());
@@ -86,7 +98,7 @@ describe('SheetsScrollRenderController', () => {
             { ctrlKey: false, shiftKey: false, deltaX: 7, deltaY: 10, preventDefault },
             { stopPropagation: () => { } }
         );
-        flushWheelFrame();
+        flushWheelFrame(scene);
 
         expect(executeSpy).toHaveBeenCalledWith(SetScrollRelativeCommand.id, { offsetX: 7, offsetY: 10 });
 
@@ -101,7 +113,11 @@ describe('SheetsScrollRenderController', () => {
             parentClassType: RENDER_CLASS_TYPE.ENGINE,
         });
         const { context, scene, contextService } = testBed;
-        vi.spyOn(testBed.get(ICommandService), 'executeCommand').mockResolvedValue(true);
+        vi.spyOn(testBed.get(ICommandService), 'executeCommand').mockImplementation(async (_id, params) => {
+            const viewport = scene.getViewport(SHEET_VIEWPORT_KEY.VIEW_MAIN)!;
+            viewport.viewportScrollY += (params as { offsetY: number }).offsetY;
+            return true as never;
+        });
         const preserveCacheSpy = vi.spyOn(scene, 'makeDirtyForScrolling');
         const makeDirtySpy = vi.spyOn(scene, 'makeDirty');
         const mainLayer = {
@@ -115,7 +131,7 @@ describe('SheetsScrollRenderController', () => {
             { ctrlKey: false, shiftKey: false, deltaX: 0, deltaY: 10, preventDefault: vi.fn() },
             { stopPropagation: vi.fn() }
         );
-        flushWheelFrame();
+        flushWheelFrame(scene);
 
         expect(preserveCacheSpy).toHaveBeenCalledWith();
 
@@ -124,7 +140,7 @@ describe('SheetsScrollRenderController', () => {
             { ctrlKey: false, shiftKey: false, deltaX: 0, deltaY: 10, preventDefault: vi.fn() },
             { stopPropagation: vi.fn() }
         );
-        flushWheelFrame();
+        flushWheelFrame(scene);
         expect(makeDirtySpy).toHaveBeenCalledWith(true);
         expect(preserveCacheSpy).toHaveBeenCalledTimes(1);
 
@@ -134,7 +150,7 @@ describe('SheetsScrollRenderController', () => {
             { ctrlKey: false, shiftKey: false, deltaX: 0, deltaY: 10, preventDefault: vi.fn() },
             { stopPropagation: vi.fn() }
         );
-        flushWheelFrame();
+        flushWheelFrame(scene);
         expect(makeDirtySpy).toHaveBeenCalledTimes(2);
         void controller;
     });
@@ -159,6 +175,7 @@ describe('SheetsScrollRenderController', () => {
             type: CommandType.COMMAND,
             handler: () => {
                 pending = armReuse;
+                scene.getViewport(SHEET_VIEWPORT_KEY.VIEW_MAIN)!.viewportScrollY += 10;
                 return true;
             },
         });
@@ -174,7 +191,7 @@ describe('SheetsScrollRenderController', () => {
                 { ctrlKey: false, shiftKey: false, deltaX: 0, deltaY: 10, preventDefault: vi.fn() },
                 { stopPropagation: vi.fn() }
             );
-            flushWheelFrame();
+            flushWheelFrame(scene);
         };
 
         try {
@@ -222,7 +239,7 @@ describe('SheetsScrollRenderController', () => {
             { ctrlKey: false, shiftKey: true, deltaX: 3, deltaY: 7, preventDefault },
             { stopPropagation }
         );
-        flushWheelFrame();
+        flushWheelFrame(scene);
 
         expect(executeSpy).toHaveBeenCalledWith(SetScrollRelativeCommand.id, { offsetX: 21, offsetY: 0 });
         expect(preventDefault).toHaveBeenCalled();
@@ -265,7 +282,7 @@ describe('SheetsScrollRenderController', () => {
             { ctrlKey: false, shiftKey: false, deltaX: 0, deltaY: -40, preventDefault },
             { stopPropagation: () => { } }
         );
-        flushWheelFrame();
+        flushWheelFrame(scene);
 
         expect(viewMain.limitedScroll).toHaveBeenCalledWith(0, 2);
         expect(preventDefault).toHaveBeenCalled();
@@ -294,7 +311,7 @@ describe('SheetsScrollRenderController', () => {
             { ctrlKey: false, shiftKey: false, deltaX: 12, deltaY: 20, preventDefault },
             { stopPropagation: () => { } }
         );
-        flushWheelFrame();
+        flushWheelFrame(scene);
 
         expect(executeSpy).toHaveBeenCalledWith(SetScrollRelativeCommand.id, { offsetX: 6, offsetY: 10 });
         void controller;
@@ -322,12 +339,128 @@ describe('SheetsScrollRenderController', () => {
             { ctrlKey: false, shiftKey: false, deltaX: 20, deltaY: 8, preventDefault },
             { stopPropagation: () => { } }
         );
-        flushWheelFrame();
+        flushWheelFrame(scene);
 
         expect(executeSpy).toHaveBeenCalledTimes(1);
         expect(executeSpy).toHaveBeenCalledWith(SetScrollRelativeCommand.id, { offsetX: 20, offsetY: 20 });
 
         void controller;
+    });
+
+    it('flushes accumulated wheel input before the next engine paint and cancels it on disposal', () => {
+        const beginFrame$ = new Subject<number>();
+        const testBed = createRenderTestBed({
+            dependencies: [[SheetScrollManagerService, { useValue: createScrollManagerServiceMock() }]],
+        });
+        const { scene, context, contextService, injector } = testBed;
+        vi.spyOn(scene, 'getEngine').mockReturnValue({ width: 800, height: 600, beginFrame$: beginFrame$.asObservable() } as any);
+        const commands = injector.get(ICommandService);
+        const execute = vi.spyOn(commands, 'executeCommand').mockResolvedValue(true);
+        contextService.setContextValue(FOCUSING_SHEET, true);
+        injector.add([SheetsScrollRenderController, { useFactory: () => injector.createInstance(SheetsScrollRenderController, context as any) }]);
+        const controller = injector.get(SheetsScrollRenderController);
+        const wheel = (offsetY: number) => scene.onMouseWheel$.emit(
+            { ctrlKey: false, shiftKey: false, deltaX: 0, deltaY: offsetY, preventDefault: vi.fn() },
+            { stopPropagation: vi.fn() }
+        );
+        wheel(10);
+        wheel(20);
+        expect(execute).not.toHaveBeenCalled();
+        expect(pendingAnimationFrames).toHaveLength(0);
+        beginFrame$.next(1);
+        expect(execute).toHaveBeenCalledExactlyOnceWith(SetScrollRelativeCommand.id, { offsetX: 0, offsetY: 30 });
+        expect(beginFrame$.observed).toBe(false);
+        wheel(40);
+        controller.dispose();
+        beginFrame$.next(2);
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(beginFrame$.observed).toBe(false);
+        testBed.univer.dispose();
+    });
+
+    it('does not invalidate the scene again when wheel input cannot move a clean viewport', () => {
+        const testBed = createRenderTestBed({
+            dependencies: [[SheetScrollManagerService, { useValue: createScrollManagerServiceMock() }]],
+        });
+        const { scene, context, contextService, injector } = testBed;
+        vi.spyOn(injector.get(ICommandService), 'executeCommand').mockResolvedValue(true);
+        contextService.setContextValue(FOCUSING_SHEET, true);
+        injector.add([SheetsScrollRenderController, { useFactory: () => injector.createInstance(SheetsScrollRenderController, context as any) }]);
+        const controller = injector.get(SheetsScrollRenderController);
+        const dirty = vi.spyOn(scene, 'makeDirty');
+        const scrolling = vi.spyOn(scene, 'makeDirtyForScrolling');
+        scene.onMouseWheel$.emit(
+            { ctrlKey: false, shiftKey: false, deltaX: 0, deltaY: -20, preventDefault: vi.fn() },
+            { stopPropagation: vi.fn() }
+        );
+        flushWheelFrame(scene);
+        expect(dirty).not.toHaveBeenCalled();
+        expect(scrolling).not.toHaveBeenCalled();
+        controller.dispose();
+        testBed.univer.dispose();
+    });
+
+    it('retains the animation-frame fallback when the host has no engine frame signal', () => {
+        const testBed = createRenderTestBed({
+            dependencies: [[SheetScrollManagerService, { useValue: createScrollManagerServiceMock() }]],
+        });
+        const { scene, context, contextService, injector } = testBed;
+        vi.spyOn(scene, 'getEngine').mockReturnValue({ width: 800, height: 600 } as any);
+        const execute = vi.spyOn(injector.get(ICommandService), 'executeCommand').mockResolvedValue(true);
+        injector.add([SheetsScrollRenderController, { useFactory: () => injector.createInstance(SheetsScrollRenderController, context as any) }]);
+        const controller = injector.get(SheetsScrollRenderController);
+        contextService.setContextValue(FOCUSING_SHEET, true);
+        scene.onMouseWheel$.emit(
+            { ctrlKey: false, shiftKey: false, deltaX: 0, deltaY: 12, preventDefault: vi.fn() },
+            { stopPropagation: vi.fn() }
+        );
+        expect(execute).not.toHaveBeenCalled();
+        expect(pendingAnimationFrames).toHaveLength(1);
+        flushWheelFrame(scene);
+        expect(execute).toHaveBeenCalledExactlyOnceWith(SetScrollRelativeCommand.id, { offsetX: 0, offsetY: 12 });
+        controller.dispose();
+        testBed.univer.dispose();
+    });
+
+    it.each(['deactivate', 'worksheet', 'focus'])('drops queued wheel input after changing %s', (change) => {
+        const testBed = createRenderTestBed({
+            dependencies: [[SheetScrollManagerService, { useValue: createScrollManagerServiceMock() }]],
+            workbookData: {
+                id: 'wheel-book',
+                name: 'wheel',
+                appVersion: '1',
+                locale: LocaleType.EN_US,
+                styles: {},
+                sheetOrder: ['first', 'second'],
+                sheets: { first: { id: 'first', name: 'first' }, second: { id: 'second', name: 'second' } },
+            },
+        });
+        const { scene, context, contextService, injector, sheet } = testBed;
+        const execute = vi.spyOn(injector.get(ICommandService), 'executeCommand').mockResolvedValue(true);
+        injector.add([SheetsScrollRenderController, { useFactory: () => injector.createInstance(SheetsScrollRenderController, context as any) }]);
+        const controller = injector.get(SheetsScrollRenderController);
+        contextService.setContextValue(FOCUSING_SHEET, true);
+        const wheel = (deltaY: number) => scene.onMouseWheel$.emit(
+            { ctrlKey: false, shiftKey: false, deltaX: 0, deltaY, preventDefault: vi.fn() },
+            { stopPropagation: vi.fn() }
+        );
+        wheel(20);
+        if (change === 'deactivate') {
+            (context.activated$ as Subject<boolean>).next(false);
+        } else if (change === 'worksheet') {
+            sheet.setActiveSheet(sheet.getSheetBySheetId('second')!);
+        } else {
+            contextService.setContextValue(FOCUSING_SHEET, false);
+        }
+        flushWheelFrame(scene);
+        expect(execute).not.toHaveBeenCalled();
+        (context.activated$ as Subject<boolean>).next(true);
+        contextService.setContextValue(FOCUSING_SHEET, true);
+        wheel(8);
+        flushWheelFrame(scene);
+        expect(execute).toHaveBeenCalledExactlyOnceWith(SetScrollRelativeCommand.id, { offsetX: 0, offsetY: 8 });
+        controller.dispose();
+        testBed.univer.dispose();
     });
 
     it('updates scroll state from viewport events and executes ScrollCommand when scrolling bar', () => {
@@ -485,5 +618,95 @@ describe('SheetsScrollRenderController', () => {
         expect(scrolled).toBe(true);
 
         void controller;
+    });
+});
+
+describe('Chart viewport scrolling with real providers', () => {
+    it('uses page pixels, refuses cell scroll and cancels pending Grid wheel and animation across hosts', () => {
+        const { render, manager, activate, commands } = createChartRenderTestBed([
+            [SheetScrollManagerService],
+            [SheetsScrollRenderController],
+        ]);
+        commands.registerCommand(ScrollCommand);
+        commands.registerCommand(SetScrollRelativeCommand);
+        commands.registerCommand(SetScrollOperation);
+        const service = render.with(SheetsScrollRenderController);
+        const scrollManager = render.with(SheetScrollManagerService);
+        const main = render.scene.getMainViewport();
+        const wheel = { deltaX: 0, deltaY: 100, preventDefault: () => {}, ctrlKey: false, shiftKey: false } as IWheelEvent;
+        const callbacks: FrameRequestCallback[] = [];
+        const scheduler = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation((callback) => {
+            callbacks.push(callback);
+            return callbacks.length;
+        });
+        onTestFinished(() => scheduler.mockRestore());
+        render.scene.onMouseWheel$.emitEvent(wheel);
+        service._smoothScrollToViewportPos({ viewportMain: main, viewportScrollX: 400, viewportScrollY: 400, duration: 200 });
+        activate('chart');
+        expect(scrollManager.getCurrentScrollState()).toEqual({ sheetViewStartRow: 0, sheetViewStartColumn: 0, offsetX: 0, offsetY: 0 });
+        expect(main.scrollAnimationFrameId).toBeNull();
+        render.scene.transformByState({ width: 2000, height: 2000 });
+        callbacks.forEach((callback) => callback(performance.now() + 300));
+        scheduler.mockRestore();
+        vi.advanceTimersByTime(300);
+        expect(main.viewportScrollY).toBe(0);
+        expect(service.scrollToCell(5, 5)).toBe(false);
+        expect(service.scrollToRange({ startRow: 5, endRow: 5, startColumn: 5, endColumn: 5 })).toBe(false);
+        render.scene.onMouseWheel$.emitEvent(wheel);
+        vi.advanceTimersByTime(20);
+        expect(main.viewportScrollY).toBe(100);
+        expect(scrollManager.getCurrentScrollState()).toEqual({ sheetViewStartRow: 0, sheetViewStartColumn: 0, offsetX: 0, offsetY: 0 });
+        expect(manager.getCurrentSkeleton()).toBeUndefined();
+        activate('grid');
+        expect(service.scrollToCell(5, 5)).toBe(true);
+        expect(scrollManager.getCurrentScrollState()).toMatchObject({ sheetViewStartRow: 3, sheetViewStartColumn: 3 });
+    });
+});
+
+describe('Deferred Chart scroll isolation', () => {
+    it('discards a Grid selection expansion when its host was left before the deferred scroll', async () => {
+        const { render, activate, commands, workbook } = createChartRenderTestBed([
+            [SheetScrollManagerService],
+            [SheetsScrollRenderController],
+            [SheetSelectionRenderService],
+        ]);
+        commands.registerCommand(ExpandSelectionCommand);
+        commands.registerCommand(ScrollCommand);
+        commands.registerCommand(SetScrollOperation);
+        commands.syncExecuteCommand(SetSelectionsOperation.id, {
+            unitId: workbook.getUnitId(),
+            subUnitId: 'grid',
+            selections: [{ range: { startRow: 39, endRow: 39, startColumn: 0, endColumn: 0 }, primary: workbook.getActiveSheet().getCellInfoInMergeData(39, 0) }],
+        });
+        expect(await commands.executeCommand(ExpandSelectionCommand.id, { direction: Direction.DOWN })).toBe(true);
+        activate('chart');
+        activate('grid');
+        render.with(SheetsScrollRenderController).scrollToCell(2, 2);
+        const main = render.scene.getMainViewport();
+        expect(main.viewportScrollY).toBe(0);
+        vi.advanceTimersByTime(1);
+        expect(main.viewportScrollY).toBe(0);
+    });
+});
+
+describe('Chart scroll lifecycle disposal', () => {
+    it('discards already-dequeued viewport callbacks after disposing the real render unit', () => {
+        const { render, injector, workbook } = createChartRenderTestBed([
+            [SheetScrollManagerService],
+            [SheetsScrollRenderController],
+        ]);
+        const callbacks: FrameRequestCallback[] = [];
+        const scheduler = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation((callback) => {
+            callbacks.push(callback);
+            return callbacks.length;
+        });
+        onTestFinished(() => scheduler.mockRestore());
+        const main = render.scene.getMainViewport();
+        render.scene.onMouseWheel$.emitEvent({ deltaY: 100, deltaX: 0, preventDefault: () => {} } as IWheelEvent);
+        render.with(SheetsScrollRenderController)._smoothScrollToViewportPos({ viewportMain: main, viewportScrollX: 400, viewportScrollY: 400, duration: 200 });
+        const before = main.viewportScrollY;
+        injector.get(IRenderManagerService).removeRender(workbook.getUnitId());
+        expect(() => callbacks.forEach((callback) => callback(performance.now() + 300))).not.toThrow();
+        expect(main.viewportScrollY).toBe(before);
     });
 });

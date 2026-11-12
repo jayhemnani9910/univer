@@ -109,6 +109,72 @@ function createNativeContext() {
 describe('canvas context', () => {
     afterEach(() => vi.restoreAllMocks());
 
+    it('reuses scale during a drawing scope without sharing mutable public transform snapshots', () => {
+        const native = createNativeContext();
+        const ctx = new UniverRenderingContext2D(native);
+        ctx.withCachedScale(() => {
+            expect(ctx.getScale()).toEqual({ scaleX: 2, scaleY: 4 });
+            ctx.moveToByPrecision(1.2, 2.3);
+            ctx.lineToByPrecision(3.4, 4.5);
+            expect(native.getTransform).toHaveBeenCalledTimes(1);
+            const snapshot = ctx.getTransform();
+            snapshot.a = 99;
+            expect(ctx.getTransform().a).toBe(2);
+            expect(ctx.getScale()).toEqual({ scaleX: 2, scaleY: 4 });
+        });
+        expect(native.moveTo).toHaveBeenCalledWith(1, 2.25);
+        expect(native.lineTo).toHaveBeenCalledWith(3.5, 4.5);
+        vi.mocked(native.getTransform).mockReturnValue({ a: 3, b: 4, c: 0, d: 6 } as DOMMatrix);
+        expect(ctx.getScale()).toEqual({ scaleX: 5, scaleY: 6 });
+    });
+
+    it.each([
+        (ctx: UniverRenderingContext2D) => ctx.restore(),
+        (ctx: UniverRenderingContext2D) => ctx.reset(),
+        (ctx: UniverRenderingContext2D) => ctx.resetTransform(),
+        (ctx: UniverRenderingContext2D) => ctx.rotate(0.3),
+        (ctx: UniverRenderingContext2D) => ctx.scale(2, 3),
+        (ctx: UniverRenderingContext2D) => ctx.setTransform(1, 0, 0, 1, 2, 3),
+        (ctx: UniverRenderingContext2D) => ctx.transform(1, 0, 0, 1, 2, 3),
+        (ctx: UniverRenderingContext2D) => ctx.translate(2, 3),
+        (ctx: UniverRenderingContext2D) => ctx.translateWithPrecision(2, 3),
+        (ctx: UniverRenderingContext2D) => ctx.translateWithPrecisionRatio(2, 3),
+    ])('refreshes scoped scale after a context transformation (%#)', (transform) => {
+        const native = createNativeContext();
+        const ctx = new UniverRenderingContext2D(native);
+        ctx.withCachedScale(() => {
+            expect(ctx.getScale()).toEqual({ scaleX: 2, scaleY: 4 });
+            vi.mocked(native.getTransform).mockReturnValue({ a: 0, b: 3, c: 5, d: 0 } as DOMMatrix);
+            transform(ctx);
+            expect(ctx.getScale()).toEqual({ scaleX: 3, scaleY: 5 });
+        });
+    });
+
+    it('clears nested and failed drawing scopes and leaves ordinary scale reads live', () => {
+        const native = createNativeContext();
+        const ctx = new UniverRenderingContext2D(native);
+        ctx.withCachedScale(() => {
+            expect(ctx.getScale().scaleX).toBe(2);
+            expect(() => ctx.withCachedScale(() => {
+                expect(ctx.getScale().scaleX).toBe(2);
+                throw new Error('draw failed');
+            })).toThrow('draw failed');
+            vi.mocked(native.getTransform).mockReturnValue({ a: 7, b: 0, c: 0, d: 8 } as DOMMatrix);
+            expect(ctx.getScale()).toEqual({ scaleX: 7, scaleY: 8 });
+            ctx.getScale();
+            expect(native.getTransform).toHaveBeenCalledTimes(3);
+        });
+        ctx.getScale();
+        ctx.getScale();
+        expect(native.getTransform).toHaveBeenCalledTimes(5);
+        expect(() => ctx.withCachedScale(() => {
+            ctx.getScale();
+            throw new Error('outer draw failed');
+        })).toThrow('outer draw failed');
+        vi.mocked(native.getTransform).mockReturnValue({ a: 9, b: 0, c: 0, d: 10 } as DOMMatrix);
+        expect(ctx.getScale()).toEqual({ scaleX: 9, scaleY: 10 });
+    });
+
     it('forwards style and basic drawing calls', () => {
         const nativeCtx = createNativeContext();
         const renderCtx = new UniverRenderingContext2D(nativeCtx, {

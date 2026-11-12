@@ -53,6 +53,7 @@ const PRINTING_GRIDLINES_COLOR = getColor([214, 216, 219]);
 interface IRepaintBound {
     bound: IBoundRectNoAngle;
     repairsMerge: boolean;
+    repairsNativeText?: boolean;
 }
 
 interface IScrollCacheState {
@@ -65,6 +66,10 @@ interface IScrollCacheState {
     left: number;
     top: number;
     axisAligned: boolean;
+    viewportLeft: number;
+    viewportTop: number;
+    viewportRight: number;
+    viewportBottom: number;
 }
 
 interface ISparseExtensionFeatureFlags {
@@ -251,6 +256,27 @@ function getOutwardRoundedBound(bound: IBoundRectNoAngle): IBoundRectNoAngle {
         right: Math.ceil(bound.right),
         bottom: Math.ceil(bound.bottom),
     };
+}
+
+function appendRepaintBound(bounds: IRepaintBound[], next: IRepaintBound) {
+    for (let index = 0; index < bounds.length;) {
+        const previous = bounds[index];
+        if (!getIntersectBound(next.bound, previous.bound)) {
+            index++;
+            continue;
+        }
+        next.bound = {
+            left: Math.min(next.bound.left, previous.bound.left),
+            top: Math.min(next.bound.top, previous.bound.top),
+            right: Math.max(next.bound.right, previous.bound.right),
+            bottom: Math.max(next.bound.bottom, previous.bound.bottom),
+        };
+        next.repairsMerge ||= previous.repairsMerge;
+        next.repairsNativeText ||= previous.repairsNativeText;
+        bounds.splice(index, 1);
+        index = 0;
+    }
+    bounds.push(next);
 }
 
 function getClippedBoundArea(bound: IBoundRectNoAngle, clipBound: IBoundRectNoAngle) {
@@ -687,12 +713,14 @@ export class Spreadsheet extends SheetComponent {
         const shouldRefreshForMergeRepairArea = exceedsMergeRepairThreshold(viewportInfo.cacheBound, repaintBounds, mergeRepairBounds.length > 0);
         const shouldRefreshForHorizontalResampling = this._requiresHorizontalResampling(mainCtx, viewportInfo);
         // Fractional frozen-column clipping changes translucent edge coverage after a vertical cache copy.
-        const shouldRefreshForFrozenEdge = viewportInfo.viewportKey === SHEET_VIEWPORT_KEY.VIEW_MAIN_LEFT
-            && diffY !== 0 && this._hasFractionalViewportPixels(viewportInfo);
+        const shouldRefreshForFrozenEdge = (viewportInfo.viewportKey === SHEET_VIEWPORT_KEY.VIEW_MAIN_LEFT
+            && diffY !== 0 && this._hasFractionalViewportPixels(viewportInfo))
+            || this._requiresNativeFrozenEdgeRepaint(mainCtx, viewportInfo, repaintBounds);
         const shouldRefreshForNativeGridlines = isScrolling && this._requiresNativeGridlineRepaint(mainCtx, spreadsheetSkeleton, viewportInfo, hasMergeData);
+        const shouldRefreshForGapStripes = isScrolling && this._requiresGapStripeRepaint(spreadsheetSkeleton, viewportInfo);
         const incompatibleCache = this._scrollCacheStates.has(viewportInfo.viewportKey) && !previousState;
         const shouldRefreshCache = isDirty || isForceDirty || incompatibleCache || isScrollJumpOutsideCache || shouldRefreshForMergeRepairArea
-            || shouldRefreshForHorizontalResampling || shouldRefreshForFrozenEdge || shouldRefreshForNativeGridlines ||
+            || shouldRefreshForHorizontalResampling || shouldRefreshForFrozenEdge || shouldRefreshForNativeGridlines || shouldRefreshForGapStripes ||
             (shouldCacheUpdate && diffX !== 0 && !this._canPaintHorizontalScrollIncrementally(mainCtx, viewportInfo));
         if (diffBounds.length === 0 || (diffX === 0 && diffY === 0) || shouldRefreshCache) {
             if (shouldRefreshCache) {
@@ -714,7 +742,7 @@ export class Spreadsheet extends SheetComponent {
                 scaleY,
                 columnHeaderHeightAndMarginTop,
                 rowHeaderWidthAndMarginLeft,
-            }, mergeRepairBounds);
+            }, mergeRepairBounds, repaintBounds);
             cacheCtx.restore();
             cacheCtx = renderCacheCanvas.getContext();
             cacheCtx.save();
@@ -810,7 +838,110 @@ export class Spreadsheet extends SheetComponent {
                 }
             }
         }
-        return repaintBounds;
+        return this._addNativeTextClipRepairBounds(repaintBounds, viewportInfo, mainCtx);
+    }
+
+    private _addNativeTextClipRepairBounds(
+        repaintBounds: IRepaintBound[],
+        viewportInfo: IViewportInfo,
+        mainCtx: UniverRenderingContext2D
+    ): IRepaintBound[] {
+        const previous = this._getReusableScrollCacheState(mainCtx, viewportInfo);
+        const skeleton = this.getSkeleton();
+        if (!previous || !skeleton || (!viewportInfo.diffX && !viewportInfo.diffY)) {
+            return repaintBounds;
+        }
+        const current = this._getScrollCacheState(mainCtx, viewportInfo);
+        const columns = skeleton.columnWidthAccumulation;
+        const rows = skeleton.rowHeightAccumulation;
+        const headerX = skeleton.rowHeaderWidthAndMarginLeft;
+        const headerY = skeleton.columnHeaderHeightAndMarginTop;
+        const bounds: IRepaintBound[] = [];
+        const addBound = (bound: IBoundRectNoAngle, repairsMerge: boolean, repairsNativeText = false) => {
+            const clipped = getIntersectBound(bound, viewportInfo.cacheBound);
+            if (clipped) {
+                appendRepaintBound(bounds, { bound: clipped, repairsMerge, repairsNativeText });
+            }
+        };
+        const getBound = (range: IRange): IBoundRectNoAngle => ({
+            // Include bordering ink so a repaired join is never combined with its older antialiasing.
+            left: (columns[range.startColumn - 1] ?? 0) + headerX - SCROLL_REPAIR_INK_HALO / current.scaleX,
+            right: columns[range.endColumn] + headerX + SCROLL_REPAIR_INK_HALO / current.scaleX,
+            top: (rows[range.startRow - 1] ?? 0) + headerY - SCROLL_REPAIR_INK_HALO / current.scaleY,
+            bottom: rows[range.endRow] + headerY + SCROLL_REPAIR_INK_HALO / current.scaleY,
+        });
+        const addRange = (range: IRange) => {
+            addBound(getBound(range), false, true);
+            for (const merge of skeleton.worksheet.getMergedCellRange(range.startRow, range.startColumn, range.endRow, range.endColumn)) {
+                addBound(getBound(merge), true, true);
+            }
+            for (let row = range.startRow; row <= range.endRow; row++) {
+                const values = skeleton.overflowCache.getRow(row);
+                for (const column in values) {
+                    const overflow = values[Number(column)];
+                    if (overflow.startColumn <= range.endColumn && overflow.endColumn >= range.startColumn) {
+                        addBound(getBound({
+                            startRow: row,
+                            endRow: row,
+                            startColumn: Math.min(Number(column), overflow.startColumn),
+                            endColumn: Math.max(Number(column), overflow.endColumn),
+                        }), false, true);
+                    }
+                }
+            }
+        };
+        for (const { bound, repairsMerge } of repaintBounds) {
+            addBound(bound, repairsMerge);
+        }
+        const nativeClipRanges = this._fontExtension.getNativeTextClipRepairRanges(skeleton)
+            .map((range) => ({ range, bound: getIntersectBound(getBound(range), viewportInfo.cacheBound) }));
+        let expanded = true;
+        while (expanded) {
+            expanded = false;
+            for (const { range, bound } of nativeClipRanges) {
+                if (!bound || !bounds.some((item) => getIntersectBound(item.bound, bound))
+                    || bounds.some((item) => item.bound.left <= bound.left && item.bound.right >= bound.right
+                        && item.bound.top <= bound.top && item.bound.bottom >= bound.bottom)) {
+                    continue;
+                }
+                // Clipping native rotated or shrink-to-fit text changes its antialiasing; repair its complete cell clip.
+                addRange(range);
+                expanded = true;
+            }
+        }
+        return bounds;
+    }
+
+    private _requiresNativeFrozenEdgeRepaint(
+        mainCtx: UniverRenderingContext2D,
+        viewportInfo: IViewportInfo,
+        repaintBounds: IRepaintBound[]
+    ): boolean {
+        const vertical = viewportInfo.viewportKey === SHEET_VIEWPORT_KEY.VIEW_MAIN_LEFT && viewportInfo.diffY !== 0;
+        const horizontal = viewportInfo.viewportKey === SHEET_VIEWPORT_KEY.VIEW_MAIN_TOP && viewportInfo.diffX !== 0;
+        if (!mainCtx._context || (!vertical && !horizontal)) {
+            return false;
+        }
+        const { a, d } = mainCtx.getTransform();
+        const cache = viewportInfo.cacheBound;
+        // Native joins at a frozen band's unbuffered edges cannot mix old and newly clipped coverage.
+        return repaintBounds.some(({ bound, repairsNativeText }) => repairsNativeText
+            && ((vertical && (bound.left <= cache.left + SCROLL_REPAIR_INK_HALO / a || bound.right >= cache.right - SCROLL_REPAIR_INK_HALO / a))
+                || (horizontal && (bound.top <= cache.top + SCROLL_REPAIR_INK_HALO / d || bound.bottom >= cache.bottom - SCROLL_REPAIR_INK_HALO / d))));
+    }
+
+    private _requiresGapStripeRepaint(skeleton: SpreadsheetSkeleton, viewportInfo: IViewportInfo): boolean {
+        const { rowGaps, colGaps } = skeleton.gapConfig ?? {};
+        const { diffX, diffY } = viewportInfo;
+        if ((!diffX || !rowGaps) && (!diffY || !colGaps)) {
+            return false;
+        }
+        const range = skeleton.getCacheRangeByViewport(viewportInfo);
+        // Gap stripes start at the drawing range's edge; translated pixels can retain an older phase.
+        return (diffX !== 0 && Object.entries(rowGaps ?? {}).some(([row, gap]) =>
+            gap.size > 0 && Number(row) >= range.startRow && Number(row) <= range.endRow))
+            || (diffY !== 0 && Object.entries(colGaps ?? {}).some(([col, gap]) =>
+                gap.size > 0 && Number(col) >= range.startColumn && Number(col) <= range.endColumn));
     }
 
     private _requiresNativeGridlineRepaint(ctx: UniverRenderingContext2D, skeleton: SpreadsheetSkeleton, viewportInfo: IViewportInfo, hasMergeData: boolean): boolean {
@@ -843,11 +974,17 @@ export class Spreadsheet extends SheetComponent {
     }
 
     private _requiresHorizontalResampling(mainCtx: UniverRenderingContext2D, viewportInfo: IViewportInfo): boolean {
-        if (viewportInfo.diffX !== 0 && this._hasFractionalViewportPixels(viewportInfo)) {
+        const hasFractionalHorizontalEdge = viewportInfo.diffX !== 0 && this._hasFractionalViewportPixels(viewportInfo);
+        // Preserve native clip coverage for diagonal copies and horizontally scrolling frozen rows.
+        if (hasFractionalHorizontalEdge && (viewportInfo.diffY !== 0
+            || viewportInfo.viewportKey === SHEET_VIEWPORT_KEY.VIEW_MAIN_TOP)) {
             return true;
         }
         if (this._getReusableScrollCacheState(mainCtx, viewportInfo)) {
             return false;
+        }
+        if (hasFractionalHorizontalEdge) {
+            return true;
         }
         const transform = mainCtx.getTransform();
         // Rounded scroll bounds can still disagree with a fractional canvas origin at pixel boundaries.
@@ -875,6 +1012,10 @@ export class Spreadsheet extends SheetComponent {
             left: Math.round((e / a - viewportInfo.leftOrigin + viewportInfo.bufferEdgeX) * a),
             top: Math.round((f / d - viewportInfo.topOrigin + viewportInfo.bufferEdgeY) * d),
             axisAligned: a > 0 && d > 0 && b === 0 && c === 0,
+            viewportLeft: viewportInfo.viewPortPosition.left,
+            viewportTop: viewportInfo.viewPortPosition.top,
+            viewportRight: viewportInfo.viewPortPosition.right,
+            viewportBottom: viewportInfo.viewPortPosition.bottom,
         };
     }
 
@@ -884,13 +1025,21 @@ export class Spreadsheet extends SheetComponent {
         const { a, b, c, d } = mainCtx.getTransform();
         if (!(previous?.axisAligned && canvas === previous.canvas && a > 0 && d > 0 && b === 0 && c === 0
             && a === previous.scaleX && d === previous.scaleY && canvas.getWidth() === previous.width
-            && canvas.getHeight() === previous.height && canvas.getPixelRatio() === previous.pixelRatio)) {
+            && canvas.getHeight() === previous.height && canvas.getPixelRatio() === previous.pixelRatio
+            && viewportInfo.viewPortPosition.left === previous.viewportLeft && viewportInfo.viewPortPosition.top === previous.viewportTop
+            && viewportInfo.viewPortPosition.right === previous.viewportRight && viewportInfo.viewPortPosition.bottom === previous.viewportBottom)) {
             return undefined;
         }
         const current = this._getScrollCacheState(mainCtx, viewportInfo);
+        const sceneScale = this.getScene().getAncestorScale();
+        const logicalScaleX = sceneScale.scaleX * canvas.getPixelRatio();
+        const logicalScaleY = sceneScale.scaleY * canvas.getPixelRatio();
+        // Native Canvas may report Float32 scales while viewport displacements retain scene precision.
+        const displacementScaleX = a === Math.fround(logicalScaleX) ? logicalScaleX : a;
+        const displacementScaleY = d === Math.fround(logicalScaleY) ? logicalScaleY : d;
         // The repair strips cover one rounding pixel, not precision loss at very large coordinates.
-        return Math.abs(current.left - previous.left - viewportInfo.diffX * a) <= 1 + 1e-6
-            && Math.abs(current.top - previous.top - viewportInfo.diffY * d) <= 1 + 1e-6
+        return Math.abs(current.left - previous.left - viewportInfo.diffX * displacementScaleX) <= 1 + 1e-6
+            && Math.abs(current.top - previous.top - viewportInfo.diffY * displacementScaleY) <= 1 + 1e-6
             ? previous
             : undefined;
     }
@@ -906,13 +1055,20 @@ export class Spreadsheet extends SheetComponent {
             && !this._requiresHorizontalResampling(mainCtx, viewportInfo);
     }
 
-    paintNewAreaForScrolling(viewportInfo: IViewportInfo, param: IPaintForScrolling, mergeRepairBounds: IBoundRectNoAngle[] = []) {
+    paintNewAreaForScrolling(
+        viewportInfo: IViewportInfo,
+        param: IPaintForScrolling,
+        mergeRepairBounds: IBoundRectNoAngle[] = [],
+        repaintBounds = this._getRepaintBounds(viewportInfo, mergeRepairBounds, param.mainCtx)
+    ) {
         const { cacheCanvas, cacheCtx, mainCtx, topOrigin, leftOrigin, bufferEdgeX, bufferEdgeY, scaleX, scaleY, columnHeaderHeightAndMarginTop, rowHeaderWidthAndMarginLeft } = param;
         const { diffX, diffY } = viewportInfo;
         let renderCacheCanvas = cacheCanvas;
         let renderCacheCtx = cacheCtx;
         const viewport = this.getScene().getViewport(viewportInfo.viewportKey);
-        const canSwapCache = this._getAncestorParent()?.classType === RENDER_CLASS_TYPE.ENGINE && viewport?.canvas === cacheCanvas;
+        // WebKit can rasterize identical native text differently in alternate contexts; keep the viewport's context.
+        const canSwapCache = this._getAncestorParent()?.classType === RENDER_CLASS_TYPE.ENGINE && viewport?.canvas === cacheCanvas
+            && mainCtx.getBrowserType() !== 'Safari' && !Tools.isIPhone();
 
         const previousState = this._getReusableScrollCacheState(mainCtx, viewportInfo);
         const cacheState = this._getScrollCacheState(mainCtx, viewportInfo);
@@ -945,7 +1101,6 @@ export class Spreadsheet extends SheetComponent {
             renderCacheCtx.translateWithPrecision(m.e / m.a - leftOrigin + bufferEdgeX, m.f / m.d - topOrigin + bufferEdgeY);
         }
 
-        const repaintBounds = this._getRepaintBounds(viewportInfo, mergeRepairBounds, mainCtx);
         if (repaintBounds.length) {
             for (const { bound: diffBound, repairsMerge } of repaintBounds) {
                 const { left: diffLeft, right: diffRight, bottom: diffBottom, top: diffTop } = diffBound;

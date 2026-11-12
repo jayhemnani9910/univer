@@ -51,7 +51,7 @@ function dispatchTouchEvent(
     listener(event);
 }
 
-function createController() {
+function createController(beginFrame$?: Subject<number>) {
     const rawScrollInfo$ = new Subject<any>();
     const validViewportScrollInfo$ = new Subject<any>();
     const transformerChangeStart$ = new Subject<unknown>();
@@ -122,6 +122,7 @@ function createController() {
         getBoundingClientRect: vi.fn(() => ({ left: 0, top: 0 })),
     };
     vi.spyOn(scene, 'getEngine').mockReturnValue({
+        beginFrame$: beginFrame$?.asObservable(),
         getCanvasElement: () => canvasElement,
         width: 800,
         height: 600,
@@ -139,7 +140,8 @@ function createController() {
         value: () => sceneOverlayOwnsTouch ? drawing : null,
     });
 
-    const controller = injector.createInstance(MobileSheetsScrollRenderController, context as any);
+    injector.add([MobileSheetsScrollRenderController, { useFactory: () => injector.createInstance(MobileSheetsScrollRenderController, context as any) }]);
+    const controller = injector.get(MobileSheetsScrollRenderController);
     scrollControllers.push(controller);
 
     return {
@@ -230,7 +232,6 @@ describe('MobileSheetsScrollRenderController', () => {
         executeCommand.mockClear();
         expect(frames.length).toBeGreaterThan(0);
         frames.shift()!(time + 16);
-        frames.shift()!(time + 32);
         const offsets = executeCommand.mock.lastCall![1] as { offsetX: number; offsetY: number };
         expect(executeCommand.mock.lastCall![0]).toBe(SetScrollRelativeCommand.id);
         expect(executeCommand.mock.lastCall![2]).toEqual({ fromMobileInertia: true });
@@ -594,6 +595,130 @@ describe('MobileSheetsScrollRenderController', () => {
         });
 
         now.mockRestore();
+        testBed.univer.dispose();
+    });
+
+    it.each([0.5, 1, 2])('keeps the same fling endpoint across refresh rates and dropped frames at zoom %s', async (zoom) => {
+        const distances: number[] = [];
+        for (const intervals of [[1000 / 60], [1000 / 30], [1000 / 120], [8, 40, 15, 100, 5]]) {
+            const beginFrame$ = new Subject<number>();
+            const { canvasListeners, executeCommand, sheet, viewportMain, controller, testBed } = createController(beginFrame$);
+            let time = 1000;
+            const now = vi.spyOn(performance, 'now').mockImplementation(() => time);
+            vi.spyOn(sheet.getActiveSheet(), 'getZoomRatio').mockReturnValue(zoom);
+            executeCommand.mockImplementation(async (_id, params) => {
+                const { offsetX = 0, offsetY = 0 } = params as { offsetX?: number; offsetY?: number };
+                viewportMain.viewportScrollX += offsetX;
+                viewportMain.viewportScrollY += offsetY;
+                return true as never;
+            });
+            dispatchTouchEvent(canvasListeners, 'touchstart', [{ clientX: 180, clientY: 180 }]);
+            for (let i = 1; i <= 6; i++) {
+                time += 16;
+                dispatchTouchEvent(canvasListeners, 'touchmove', [{ clientX: 180, clientY: 180 - i * 20 }]);
+            }
+            time += 16;
+            dispatchTouchEvent(canvasListeners, 'touchend', []);
+            const releaseY = viewportMain.viewportScrollY;
+            executeCommand.mockClear();
+            for (let i = 0; i < 150; i++) {
+                time += intervals[i % intervals.length];
+                beginFrame$.next(i);
+                await Promise.resolve();
+            }
+            distances.push(viewportMain.viewportScrollY - releaseY);
+            expect(distances[distances.length - 1]).toBeGreaterThan(0);
+            expect(beginFrame$.observed).toBe(false);
+            controller.dispose();
+            testBed.univer.dispose();
+            now.mockRestore();
+        }
+        for (const distance of distances) {
+            expect(distance).toBeCloseTo(distances[0], 9);
+        }
+    });
+
+    it.each([false, true])('stops at a blocked viewport after pending geometry work=%s', async (pendingGeometry) => {
+        const beginFrame$ = new Subject<number>();
+        const { canvasListeners, executeCommand, viewportMain, testBed } = createController(beginFrame$);
+        let time = 1000;
+        vi.spyOn(performance, 'now').mockImplementation(() => time);
+        dispatchTouchEvent(canvasListeners, 'touchstart', [{ clientX: 180, clientY: 180 }]);
+        time += 16;
+        dispatchTouchEvent(canvasListeners, 'touchmove', [{ clientX: 180, clientY: 140 }]);
+        time += 16;
+        dispatchTouchEvent(canvasListeners, 'touchend', []);
+        executeCommand.mockClear();
+        viewportMain.isDirty = pendingGeometry;
+        for (let i = 0; i < 10; i++) {
+            time += 16;
+            beginFrame$.next(i);
+            await Promise.resolve();
+            viewportMain.isDirty = false;
+        }
+        expect(executeCommand).toHaveBeenCalledTimes(pendingGeometry ? 2 : 1);
+        expect(beginFrame$.observed).toBe(false);
+        testBed.univer.dispose();
+    });
+
+    it('commits inertia before paint and waits for an asynchronous command without overlapping updates', async () => {
+        const beginFrame$ = new Subject<number>();
+        const { canvasListeners, executeCommand, viewportMain, controller, testBed } = createController(beginFrame$);
+        let time = 1000;
+        vi.spyOn(performance, 'now').mockImplementation(() => time);
+        dispatchTouchEvent(canvasListeners, 'touchstart', [{ clientX: 180, clientY: 180 }]);
+        time += 16;
+        dispatchTouchEvent(canvasListeners, 'touchmove', [{ clientX: 180, clientY: 140 }]);
+        time += 16;
+        dispatchTouchEvent(canvasListeners, 'touchend', []);
+        let finish: (() => void) | undefined;
+        executeCommand.mockImplementation((_id, params) => {
+            viewportMain.viewportScrollY += (params as { offsetY: number }).offsetY;
+            return new Promise<boolean>((resolve) => {
+                finish = () => resolve(true);
+            }) as never;
+        });
+        executeCommand.mockClear();
+        time += 16;
+        beginFrame$.next(1);
+        expect(viewportMain.viewportScrollY).toBeGreaterThan(0);
+        beginFrame$.next(2);
+        expect(executeCommand).toHaveBeenCalledTimes(1);
+        expect(beginFrame$.observed).toBe(false);
+        controller.dispose();
+        finish!();
+        await Promise.resolve();
+        expect(beginFrame$.observed).toBe(false);
+        testBed.univer.dispose();
+    });
+
+    it.each(['touchcancel', 'touchstart', 'pinch', 'drawing', 'deactivate'])('cancels a pending inertia frame on %s', async (action) => {
+        const beginFrame$ = new Subject<number>();
+        const { canvasListeners, executeCommand, transformerChangeStart$, controller, testBed } = createController(beginFrame$);
+        let time = 1000;
+        vi.spyOn(performance, 'now').mockImplementation(() => time);
+        dispatchTouchEvent(canvasListeners, 'touchstart', [{ clientX: 180, clientY: 180 }]);
+        time += 16;
+        dispatchTouchEvent(canvasListeners, 'touchmove', [{ clientX: 180, clientY: 140 }]);
+        time += 16;
+        dispatchTouchEvent(canvasListeners, 'touchend', []);
+        expect(beginFrame$.observed).toBe(true);
+        if (action === 'drawing') {
+            transformerChangeStart$.next({});
+        } else if (action === 'deactivate') {
+            (testBed.context.activated$ as Subject<boolean>).next(false);
+        } else if (action === 'pinch') {
+            dispatchTouchEvent(canvasListeners, 'touchstart', [{ clientX: 120, clientY: 140 }, { clientX: 180, clientY: 140 }]);
+        } else {
+            dispatchTouchEvent(canvasListeners, action, action === 'touchstart' ? [{ clientX: 180, clientY: 140 }] : []);
+        }
+        executeCommand.mockClear();
+        time += 16;
+        beginFrame$.next(1);
+        await Promise.resolve();
+        expect(executeCommand).not.toHaveBeenCalled();
+        expect(beginFrame$.observed).toBe(false);
+        controller.dispose();
         testBed.univer.dispose();
     });
 

@@ -17,7 +17,7 @@
 import type { BooleanNumber, ICommandInfo, IExecutionOptions, IRange, Nullable, Workbook, Worksheet } from '@univerjs/core';
 import type { ISetArrayFormulaDataMutationParams, ISetFormulaCalculationNotificationMutation } from '@univerjs/engine-formula';
 import type { IAfterRender$Info, IBasicFrameInfo, IExtendFrameInfo, IRenderContext, IRenderModule, IScrollBarProps, ISummaryFrameInfo, ISummaryMetric, ITimeMetric, IViewportInfos, Scene } from '@univerjs/engine-render';
-import { CommandType, ICommandService, IConfigService, Inject, Optional, Rectangle, RxDisposable, toDisposable } from '@univerjs/core';
+import { CommandType, ICommandService, IConfigService, Inject, Optional, Rectangle, RxDisposable, SheetTypes, toDisposable } from '@univerjs/core';
 import { FormulaDataModel, SetArrayFormulaDataMutation, SetFormulaCalculationNotificationMutation } from '@univerjs/engine-formula';
 import {
     Rect,
@@ -29,7 +29,12 @@ import {
     SpreadsheetRowHeader,
     Viewport,
 } from '@univerjs/engine-render';
-import { COMMAND_LISTENER_SKELETON_CHANGE, COMMAND_LISTENER_VALUE_CHANGE, MoveRangeMutation, SetRangeValuesMutation } from '@univerjs/sheets';
+import {
+    COMMAND_LISTENER_SKELETON_CHANGE,
+    COMMAND_LISTENER_VALUE_CHANGE,
+    MoveRangeMutation,
+    SetRangeValuesMutation,
+} from '@univerjs/sheets';
 import { ITelemetryService } from '@univerjs/telemetry';
 import { Subject, withLatestFrom } from 'rxjs';
 import type { IUniverSheetsUIConfig } from '../../config/config';
@@ -84,10 +89,15 @@ export class SheetRenderController extends RxDisposable implements IRenderModule
         this._initRenderMetricSubscriber();
     }
 
+    private _getSheetType(): SheetTypes | undefined {
+        return this._context.unit.getActiveSheet()?.getConfig().type;
+    }
+
     private _addNewRender() {
         const { scene, engine, unit: workbook } = this._context;
 
         this._addComponent(workbook);
+        this._initWorksheetVisibility();
         this._initRerenderScheduler();
         this._initCommandListener();
 
@@ -377,6 +387,57 @@ export class SheetRenderController extends RxDisposable implements IRenderModule
         return viewMain;
     }
 
+    private _initWorksheetVisibility(): void {
+        let chartActive = false;
+        this.disposeWithMe(this._context.unit.activeSheet$.subscribe((worksheet) => {
+            const { scene, components } = this._context;
+            const isChart = worksheet?.getConfig().type === SheetTypes.CHART;
+            if (!isChart && !chartActive) {
+                return;
+            }
+            chartActive = isChart;
+            for (const key of [SHEET_VIEW_KEY.MAIN, SHEET_VIEW_KEY.ROW, SHEET_VIEW_KEY.COLUMN, SHEET_VIEW_KEY.LEFT_TOP]) {
+                const component = components.get(key);
+                if (isChart) {
+                    component?.hide();
+                } else {
+                    component?.show();
+                }
+            }
+            if (isChart) {
+                for (const key of [
+                    SHEET_VIEWPORT_KEY.VIEW_MAIN,
+                    SHEET_VIEWPORT_KEY.VIEW_MAIN_LEFT_TOP,
+                    SHEET_VIEWPORT_KEY.VIEW_MAIN_LEFT,
+                    SHEET_VIEWPORT_KEY.VIEW_MAIN_TOP,
+                    SHEET_VIEWPORT_KEY.VIEW_ROW_TOP,
+                    SHEET_VIEWPORT_KEY.VIEW_ROW_BOTTOM,
+                    SHEET_VIEWPORT_KEY.VIEW_COLUMN_LEFT,
+                    SHEET_VIEWPORT_KEY.VIEW_COLUMN_RIGHT,
+                    SHEET_VIEWPORT_KEY.VIEW_LEFT_TOP,
+                ]) {
+                    const viewport = scene.getViewport(key);
+                    if (!viewport) {
+                        continue;
+                    }
+                    if (viewport.viewportKey === SHEET_VIEWPORT_KEY.VIEW_MAIN) {
+                        viewport.enable();
+                        viewport.setMargin(0, 0);
+                        viewport.resetPadding();
+                        viewport.resizeWhenFreezeChange({ left: 0, top: 0, right: 0, bottom: 0 });
+                    } else {
+                        viewport.disable();
+                    }
+                }
+            } else {
+                for (const key of [SHEET_VIEWPORT_KEY.VIEW_MAIN, SHEET_VIEWPORT_KEY.VIEW_ROW_BOTTOM, SHEET_VIEWPORT_KEY.VIEW_COLUMN_RIGHT, SHEET_VIEWPORT_KEY.VIEW_LEFT_TOP]) {
+                    scene.getViewport(key)?.enable();
+                }
+            }
+            scene.makeDirty();
+        }));
+    }
+
     private _initRerenderScheduler(): void {
         this.disposeWithMe(this._sheetSkeletonManagerService.currentSkeleton$.subscribe((param) => {
             if (!param) return null;
@@ -384,7 +445,9 @@ export class SheetRenderController extends RxDisposable implements IRenderModule
             const { skeleton: spreadsheetSkeleton, sheetId } = param;
             const workbook = this._context.unit;
             const worksheet = workbook?.getSheetBySheetId(sheetId);
-            if (workbook == null || worksheet == null) return;
+            if (!worksheet || worksheet !== workbook.getActiveSheet() || worksheet.getConfig().type === SheetTypes.CHART) {
+                return;
+            }
 
             const { mainComponent, components } = this._context;
             const spreadsheet = mainComponent as Spreadsheet;
@@ -505,7 +568,9 @@ export class SheetRenderController extends RxDisposable implements IRenderModule
         }
 
         scene.makeDirty();
-        if (!command.params) return;
+        if (!command.params || this._getSheetType() === SheetTypes.CHART) {
+            return;
+        }
 
         const cmdParams = command.params as Record<string, any>;
         const viewports = this._spreadsheetViewports(scene);
@@ -573,8 +638,14 @@ export class SheetRenderController extends RxDisposable implements IRenderModule
     }
 
     private _rangeToBounds(ranges: IRange[]) {
-        const skeleton = this._sheetSkeletonManagerService.getCurrentParam()!.skeleton;
-        const { rowHeightAccumulation, columnWidthAccumulation, rowHeaderWidth, columnHeaderHeight } = skeleton;
+        // Backstop for a stale or disposed current skeleton: the manager now follows the active worksheet, but a
+        // mutation can still arrive while the skeleton param is in flux, and a dirty-bounds miss is harmless.
+        const param = this._sheetSkeletonManagerService.getCurrentParam();
+        if (!param) {
+            return [];
+        }
+
+        const { rowHeightAccumulation, columnWidthAccumulation, rowHeaderWidth, columnHeaderHeight } = param.skeleton;
 
         const dirtyBounds: IViewportInfos[] = [];
         for (const r of ranges) {

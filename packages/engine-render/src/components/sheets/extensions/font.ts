@@ -154,6 +154,32 @@ export class Font extends SheetExtension {
         return parent?.getDocuments();
     }
 
+    getNativeTextClipRepairRanges(skeleton: SpreadsheetSkeleton): IRange[] {
+        const ranges: IRange[] = [];
+        skeleton.stylesCache.fontMatrix.forValue((row, column, font) => {
+            if (!font.vertexAngle && !font.centerAngle && (font.shrinkScale === undefined || font.shrinkScale === 1)) {
+                return;
+            }
+            const cell = skeleton.getCellWithCoordByIndex(row, column, false);
+            const range = skeleton.overflowCache.getValue(row, column)
+                ?? (cell.isMerged || cell.isMergedMainCell
+                    ? cell.mergeInfo
+                    : {
+                        startRow: row,
+                        endRow: row,
+                        startColumn: column,
+                        endColumn: column,
+                    });
+            ranges.push({
+                startRow: range.startRow,
+                endRow: range.endRow,
+                startColumn: range.startColumn,
+                endColumn: range.endColumn,
+            });
+        });
+        return ranges;
+    }
+
     /**
      * Safely draw fallback image, checking if it's fully loaded first.
      * If not loaded, draw a simple gray rectangle as placeholder.

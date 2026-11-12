@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-import type enUS from '../../../locale/en-US';
 import { cleanup, render } from '@testing-library/react';
 import { useContext } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
+import type enUS from '../../../locale/en-US';
 import zhCN from '../../../locale/zh-CN';
 import { ConfigContext, ConfigProvider } from '../ConfigProvider';
 

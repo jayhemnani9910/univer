@@ -17,6 +17,7 @@
 import { BorderStyleTypes, ObjectMatrix } from '@univerjs/core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BORDER_TYPE } from '../../../../basics/const';
+import { UniverRenderingContext } from '../../../../context';
 import { Border } from '../border';
 
 const drawDiagonalLineByBorderTypeMock = vi.fn((..._args: any[]) => undefined);
@@ -33,6 +34,7 @@ vi.mock('../../../../basics/draw', () => ({
 
 function createCtx() {
     return {
+        withCachedScale: (draw: () => void) => draw(),
         save: vi.fn(),
         restore: vi.fn(),
         beginPath: vi.fn(),
@@ -151,6 +153,31 @@ describe('border extension', () => {
         );
         expect(spy).toHaveBeenCalled();
         expect(ctx.translateWithPrecisionRatio).toHaveBeenCalled();
+    });
+
+    it('keeps live native transforms for custom border renderers', () => {
+        class CustomBorder extends Border { }
+        const extension = new CustomBorder();
+        const native = document.createElement('canvas').getContext('2d')!;
+        native.scale(1.25, 1.5);
+        const ctx = new UniverRenderingContext(native);
+        const scales: { scaleX: number; scaleY: number }[] = [];
+        vi.spyOn(extension, 'renderBorderByCell').mockImplementation(({ ctx }) => {
+            ctx.getScale();
+            ctx._context.scale(2, 3);
+            scales.push(ctx.getScale());
+        });
+        extension.draw(ctx, { scaleX: 1.25, scaleY: 1.5 }, {
+            worksheet: {},
+            rowHeightAccumulation: [10],
+            columnWidthAccumulation: [20],
+            columnTotalWidth: 20,
+            rowTotalHeight: 10,
+            stylesCache: { border: new ObjectMatrix({ 0: { 0: {} } }) },
+            overflowCache: new ObjectMatrix(),
+        } as any, [], { viewRanges: [{ startRow: 0, endRow: 0, startColumn: 0, endColumn: 0 }] } as any);
+        expect(scales).toEqual([{ scaleX: 2.5, scaleY: 4.5 }]);
+        expect(ctx.getScale()).toEqual({ scaleX: 1.25, scaleY: 1.5 });
     });
 
     it('handles renderBorderByCell hidden/diff branches', () => {

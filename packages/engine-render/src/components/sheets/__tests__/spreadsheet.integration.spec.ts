@@ -28,6 +28,7 @@ import {
     ObjectMatrix,
     RANGE_TYPE,
     ThemeService,
+    Tools,
     Univer,
     UniverInstanceType,
     VerticalAlign,
@@ -216,7 +217,8 @@ function createFixture(data: IWorkbookData = workbookDataFactory()): IFixture {
     viewport.scrollToViewportPos({ viewportScrollX: 30, viewportScrollY: 18 });
 
     skeleton.setScene(scene);
-    const spreadsheet = new Spreadsheet('sheet-component', skeleton, true);
+    injector.add([Spreadsheet, { useFactory: () => injector.createInstance(Spreadsheet, 'sheet-component', skeleton, true) }]);
+    const spreadsheet = get(Spreadsheet);
     scene.addObject(spreadsheet, 1);
 
     const mainCanvas = new Canvas({ width: 640, height: 360, pixelRatio: 1 });
@@ -2002,6 +2004,159 @@ describe('spreadsheet integration', () => {
         }
     });
 
+    it.each(['x', 'y'])('keeps text repairs local when the native origin crosses a precision band on %s scroll', (axis) => {
+        const { spreadsheet, skeleton, viewport, scene, mainCanvas } = fixture;
+        const canvas = viewport.canvas!;
+        canvas.setSize(700, 420, 1);
+        const ctx = mainCanvas.getContext();
+        ctx.setTransform(12, 0, 0, 12, axis === 'x' ? 1056 : 0, axis === 'y' ? 1104 : 0);
+        spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas), skeleton);
+        ctx.setTransform(12, 0, 0, 12, axis === 'x' ? 410 : 0, axis === 'y' ? 458 : 0);
+        const info = createViewportInfo(scene, viewport.canvas!, {
+            diffBounds: [axis === 'x' ? createBound(400, 0, 420, 240) : createBound(0, 220, 420, 240)],
+            diffCacheBounds: [],
+            diffX: axis === 'x' ? -646 / 12 : 0,
+            diffY: axis === 'y' ? -646 / 12 : 0,
+            shouldCacheUpdate: 0,
+            isDirty: 0,
+        });
+        const repaint = spreadsheet as unknown as {
+            _getRepaintBounds(info: IViewportInfo, merges: IBoundRectNoAngle[], context: typeof ctx): { bound: IBoundRectNoAngle }[];
+        };
+        const bounds = repaint._getRepaintBounds(info, [], ctx);
+        const point = axis === 'x' ? { x: 142, y: 40 } : { x: 82, y: 112 };
+        expect(bounds.some(({ bound }) => bound.left < point.x && bound.right > point.x
+            && bound.top < point.y && bound.bottom > point.y)).toBe(false);
+        // Panning over existing buffer pixels needs no refill; actual exposed cache pixels still do.
+        const refillBounds = repaint._getRepaintBounds({
+            ...info,
+            shouldCacheUpdate: 1,
+            diffCacheBounds: info.diffBounds,
+        }, [], ctx);
+        const exposedPoint = axis === 'x' ? { x: 410, y: 40 } : { x: 82, y: 230 };
+        expect(refillBounds.some(({ bound }) => bound.left < exposedPoint.x && bound.right > exposedPoint.x
+            && bound.top < exposedPoint.y && bound.bottom > exposedPoint.y)).toBe(true);
+        const repairedArea = refillBounds.reduce((area, { bound }) => area + (bound.right - bound.left) * (bound.bottom - bound.top), 0);
+        const cacheArea = (info.cacheBound.right - info.cacheBound.left) * (info.cacheBound.bottom - info.cacheBound.top);
+        expect(repairedArea).toBeLessThan(cacheArea * 0.2);
+    });
+
+    it.each(['x', 'y'])('keeps retained cells cached within a stable native precision band on %s scroll', (axis) => {
+        const { spreadsheet, skeleton, viewport, scene, mainCanvas } = fixture;
+        const canvas = viewport.canvas!;
+        canvas.setSize(700, 420, 1);
+        const ctx = mainCanvas.getContext();
+        ctx.setTransform(12, 0, 0, 12, 9856, 9904);
+        spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas), skeleton);
+        ctx.setTransform(12, 0, 0, 12, axis === 'x' ? 9844 : 9856, axis === 'y' ? 9892 : 9904);
+        const info = createViewportInfo(scene, viewport.canvas!, {
+            diffBounds: [axis === 'x' ? createBound(400, 0, 420, 240) : createBound(0, 220, 420, 240)],
+            diffCacheBounds: [],
+            diffX: axis === 'x' ? -1 : 0,
+            diffY: axis === 'y' ? -1 : 0,
+            shouldCacheUpdate: 0,
+            isDirty: 0,
+        });
+        const repaint = spreadsheet as unknown as {
+            _getRepaintBounds(info: IViewportInfo, merges: IBoundRectNoAngle[], context: typeof ctx): { bound: IBoundRectNoAngle }[];
+        };
+        expect(repaint._getRepaintBounds(info, [], ctx).some(({ bound }) => bound.left < 142 && bound.right > 142
+            && bound.top < 40 && bound.bottom > 40)).toBe(false);
+    });
+
+    it('keeps native rotated glyphs whole when a repair halo touches their cell clip', () => {
+        const { spreadsheet, skeleton, viewport, scene, mainCanvas } = fixture;
+        const canvas = viewport.canvas!;
+        canvas.setSize(700, 420, 1);
+        skeleton.setStylesCache(createViewportInfo(scene, canvas));
+        const ctx = mainCanvas.getContext();
+        ctx.setTransform(12, 0, 0, 12, 9856, 9904);
+        spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas), skeleton);
+        ctx.setTransform(12, 0, 0, 12, 9856, 9892);
+        const info = createViewportInfo(scene, viewport.canvas!, {
+            diffBounds: [createBound(117.9, 51.9, 125, 60)],
+            diffCacheBounds: [createBound(117.9, 51.9, 125, 60)],
+            diffX: 0,
+            diffY: -1,
+            shouldCacheUpdate: 1,
+            isDirty: 0,
+        });
+        const repaint = spreadsheet as unknown as {
+            _getRepaintBounds(info: IViewportInfo, merges: IBoundRectNoAngle[], context: typeof ctx): { bound: IBoundRectNoAngle }[];
+        };
+        expect(repaint._getRepaintBounds(info, [], ctx).some(({ bound }) => bound.left < 142 && bound.right > 142
+            && bound.top < 75 && bound.bottom > 75)).toBe(true);
+    });
+
+    it('keeps the full native cell clip when a repair halo reaches shrink-to-fit text', () => {
+        const { spreadsheet, skeleton, viewport, scene, mainCanvas, workbook } = fixture;
+        const canvas = viewport.canvas!;
+        canvas.setSize(700, 420, 1);
+        const worksheet = workbook.getActiveSheet()!;
+        const cell = worksheet.getCell(0, 3)!;
+        vi.spyOn(FontCache, 'getMeasureText').mockReturnValue({ width: 240 } as TextMetrics);
+        skeleton._setFontStylesCache(0, 3, cell, worksheet.getComposedCellStyleByCellData(0, 3, cell)!);
+        skeleton.setStylesCache(createViewportInfo(scene, canvas));
+        expect(skeleton.stylesCache.fontMatrix.getValue(0, 3)?.shrinkScale).toBeLessThan(1);
+        const ctx = mainCanvas.getContext();
+        ctx.setTransform(12, 0, 0, 12, 9856, 9904);
+        spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas), skeleton);
+        ctx.setTransform(12, 0, 0, 12, 9856, 9892);
+        const info = createViewportInfo(scene, viewport.canvas!, {
+            diffBounds: [createBound(229.9, 28, 240, 40)],
+            diffCacheBounds: [createBound(229.9, 28, 240, 40)],
+            diffX: 0,
+            diffY: -1,
+            shouldCacheUpdate: 1,
+            isDirty: 0,
+        });
+        const repaint = spreadsheet as unknown as {
+            _getRepaintBounds(info: IViewportInfo, merges: IBoundRectNoAngle[], context: typeof ctx): { bound: IBoundRectNoAngle }[];
+        };
+        expect(repaint._getRepaintBounds(info, [], ctx).some(({ bound }) => bound.left < 290 && bound.right > 290
+            && bound.top < 40 && bound.bottom > 40)).toBe(true);
+    });
+
+    it.each([SHEET_VIEWPORT_KEY.VIEW_MAIN_LEFT, SHEET_VIEWPORT_KEY.VIEW_MAIN_TOP])(
+        'preserves native fixed-edge coverage when text repair reaches %s',
+        (viewportKey) => {
+            const { spreadsheet, skeleton, viewport, scene, mainCanvas } = fixture;
+            const getViewport = scene.getViewport.bind(scene);
+            vi.spyOn(scene, 'getViewport').mockImplementation((key) => key === viewportKey ? viewport : getViewport(key));
+            const canvas = viewport.canvas!;
+            canvas.setSize(700, 420, 1);
+            skeleton.setStylesCache(createViewportInfo(scene, canvas));
+            const ctx = mainCanvas.getContext();
+            const vertical = viewportKey === SHEET_VIEWPORT_KEY.VIEW_MAIN_LEFT;
+            const bounds = vertical ? createBound(118, 28, 166, 240) : createBound(46, 52, 302, 76);
+            const initial = createViewportInfo(scene, canvas, {
+                viewportKey,
+                viewBound: bounds,
+                cacheBound: bounds,
+                bufferEdgeX: 0,
+                bufferEdgeY: 0,
+            });
+            spreadsheet.renderByViewports(ctx, initial, skeleton);
+            spreadsheet.makeDirty(false);
+            spreadsheet.makeForceDirty(false);
+            ctx.translate(vertical ? 0 : -10, vertical ? -10 : 0);
+            const refresh = vi.spyOn(spreadsheet, 'refreshCacheCanvas');
+            const paint = vi.spyOn(spreadsheet, 'paintNewAreaForScrolling');
+            spreadsheet.renderByViewports(ctx, {
+                ...initial,
+                diffX: vertical ? 0 : -10,
+                diffY: vertical ? -10 : 0,
+                diffBounds: [vertical ? createBound(118, 51.9, 166, 60) : createBound(117.9, 52, 125, 76)],
+                diffCacheBounds: [vertical ? createBound(118, 51.9, 166, 60) : createBound(117.9, 52, 125, 76)],
+                isDirty: 0,
+                isForceDirty: false,
+                shouldCacheUpdate: 1,
+            }, skeleton);
+            expect(refresh).toHaveBeenCalledOnce();
+            expect(paint).not.toHaveBeenCalled();
+        }
+    );
+
     it('rebuilds style coverage after a range reset even when the viewport stays in place', () => {
         const { skeleton, scene, cacheCanvas } = fixture;
         const info = createViewportInfo(scene, cacheCanvas);
@@ -2037,6 +2192,175 @@ describe('spreadsheet integration', () => {
             shouldCacheUpdate: 0,
         }), skeleton);
         expect(refresh).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+        { zoom: 0.3333, pixelRatio: 3 },
+        { zoom: 0.67, pixelRatio: 1.25 },
+        { zoom: 0.9, pixelRatio: 2 },
+        { zoom: 1.1, pixelRatio: 2 },
+        { zoom: 1.25, pixelRatio: 3 },
+        { zoom: 4, pixelRatio: 1.25 },
+    ])('reuses stable fractional viewport pixels at zoom $zoom and DPR $pixelRatio', ({ zoom, pixelRatio }) => {
+        const { spreadsheet, skeleton, viewport, scene, mainCanvas } = fixture;
+        const canvas = viewport.canvas!;
+        canvas.setSize(700, 420, pixelRatio);
+        const ctx = mainCanvas.getContext();
+        const scale = zoom * pixelRatio;
+        const position = createBound(46 * zoom, 24 * zoom, 420, 240);
+        ctx.setTransform(scale, 0, 0, scale, 0, 0);
+        spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas, { viewPortPosition: position }), skeleton);
+        spreadsheet.makeDirty(false);
+        spreadsheet.makeForceDirty(false);
+
+        const refresh = vi.spyOn(spreadsheet, 'refreshCacheCanvas');
+        const paint = vi.spyOn(spreadsheet, 'paintNewAreaForScrolling');
+        ctx.setTransform(scale, 0, 0, scale, -10.2 * scale, 0);
+        spreadsheet.renderByViewports(ctx, createViewportInfo(scene, viewport.canvas!, {
+            viewPortPosition: position,
+            diffX: -10.2,
+            diffBounds: [createBound(400, 0, 420, 240)],
+            diffCacheBounds: [createBound(400, 0, 460, 280)],
+            isDirty: 0,
+            isForceDirty: false,
+            shouldCacheUpdate: 1,
+        }), skeleton);
+        expect(refresh).not.toHaveBeenCalled();
+        expect(paint).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+        { zoom: 1.33, pixelRatio: 2 },
+        { zoom: 1.34, pixelRatio: 2 },
+        { zoom: 1.35, pixelRatio: 2 },
+        { zoom: 1.33, pixelRatio: 3 },
+        { zoom: 1.34, pixelRatio: 3 },
+        { zoom: 1.35, pixelRatio: 3 },
+    ].flatMap((scale) => ['x', 'y'].map((axis) => ({ ...scale, axis }))))(
+        'preserves the one-pixel scroll allowance with Float32 canvas scales at $zoom / $pixelRatio on $axis',
+        ({ zoom, pixelRatio, axis }) => {
+            const { spreadsheet, skeleton, viewport, scene, mainCanvas } = fixture;
+            const canvas = viewport.canvas!;
+            canvas.setSize(700, 700, pixelRatio);
+            scene.setScaleValueOnly(zoom, zoom);
+            const ctx = mainCanvas.getContext();
+            const logicalScale = zoom * pixelRatio;
+            const nativeScale = Math.fround(logicalScale);
+            const position = createBound(46 * zoom, 24 * zoom, 420, 240);
+            ctx.setTransform(nativeScale, 0, 0, nativeScale, 0, 0);
+            spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas, { viewPortPosition: position }), skeleton);
+            spreadsheet.makeDirty(false);
+            spreadsheet.makeForceDirty(false);
+
+            const refresh = vi.spyOn(spreadsheet, 'refreshCacheCanvas');
+            const paint = vi.spyOn(spreadsheet, 'paintNewAreaForScrolling');
+            const displacement = nativeScale > logicalScale ? -999 : -1001;
+            ctx.setTransform(nativeScale, 0, 0, nativeScale, axis === 'x' ? displacement : 0, axis === 'y' ? displacement : 0);
+            spreadsheet.renderByViewports(ctx, createViewportInfo(scene, viewport.canvas!, {
+                viewPortPosition: position,
+                diffX: axis === 'x' ? -1000 / logicalScale : 0,
+                diffY: axis === 'y' ? -1000 / logicalScale : 0,
+                diffBounds: [createBound(400, 200, 420, 240)],
+                diffCacheBounds: [createBound(400, 200, 460, 280)],
+                isDirty: 0,
+                isForceDirty: false,
+                shouldCacheUpdate: 1,
+            }), skeleton);
+            expect(refresh).not.toHaveBeenCalled();
+            expect(paint).toHaveBeenCalledOnce();
+        }
+    );
+
+    it.each(['unmatched-transform', 'larger-displacement'])(
+        'retains scroll-cache rejection for $0 after Float32 scale normalization',
+        (reason) => {
+            const { spreadsheet, skeleton, viewport, scene, mainCanvas } = fixture;
+            const canvas = viewport.canvas!;
+            canvas.setSize(700, 700, 2);
+            scene.setScaleValueOnly(reason === 'unmatched-transform' ? 1.35 : 1.34, 1.34);
+            const ctx = mainCanvas.getContext();
+            const nativeScale = Math.fround(2.68);
+            ctx.setTransform(nativeScale, 0, 0, nativeScale, 0, 0);
+            spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas), skeleton);
+            spreadsheet.makeDirty(false);
+            spreadsheet.makeForceDirty(false);
+
+            const refresh = vi.spyOn(spreadsheet, 'refreshCacheCanvas');
+            const paint = vi.spyOn(spreadsheet, 'paintNewAreaForScrolling');
+            ctx.setTransform(nativeScale, 0, 0, nativeScale, reason === 'larger-displacement' ? -998 : -999, 0);
+            spreadsheet.renderByViewports(ctx, createViewportInfo(scene, viewport.canvas!, {
+                diffX: -1000 / 2.68,
+                diffBounds: [createBound(400, 200, 420, 240)],
+                diffCacheBounds: [createBound(400, 200, 460, 280)],
+                isDirty: 0,
+                isForceDirty: false,
+                shouldCacheUpdate: 1,
+            }), skeleton);
+            expect(refresh).toHaveBeenCalledOnce();
+            expect(paint).not.toHaveBeenCalled();
+        }
+    );
+
+    it('retains full repaint for simultaneous axes at a fractional viewport edge', () => {
+        const { spreadsheet, skeleton, viewport, scene, mainCanvas } = fixture;
+        const canvas = viewport.canvas!;
+        canvas.setSize(700, 420, 2);
+        const ctx = mainCanvas.getContext();
+        const position = createBound(41.4, 21.6, 420, 240);
+        ctx.setTransform(1.8, 0, 0, 1.8, 0, 0);
+        spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas, { viewPortPosition: position }), skeleton);
+        spreadsheet.makeDirty(false);
+        spreadsheet.makeForceDirty(false);
+
+        const refresh = vi.spyOn(spreadsheet, 'refreshCacheCanvas');
+        const paint = vi.spyOn(spreadsheet, 'paintNewAreaForScrolling');
+        ctx.setTransform(1.8, 0, 0, 1.8, -18, -18);
+        spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas, {
+            viewPortPosition: position,
+            diffX: -10,
+            diffY: -10,
+            diffBounds: [createBound(400, 0, 420, 240)],
+            diffCacheBounds: [createBound(400, 0, 460, 280)],
+            isDirty: 0,
+            isForceDirty: false,
+            shouldCacheUpdate: 1,
+        }), skeleton);
+        expect(refresh).toHaveBeenCalledOnce();
+        expect(paint).not.toHaveBeenCalled();
+    });
+
+    it('retains full repaint for horizontal scrolling in a fractionally clipped frozen row band', () => {
+        const { spreadsheet, skeleton, viewport, scene, mainCanvas } = fixture;
+        const getViewport = scene.getViewport.bind(scene);
+        vi.spyOn(scene, 'getViewport').mockImplementation((key) => key === SHEET_VIEWPORT_KEY.VIEW_MAIN_TOP ? viewport : getViewport(key));
+        const canvas = viewport.canvas!;
+        canvas.setSize(700, 420, 3);
+        const ctx = mainCanvas.getContext();
+        const position = createBound(77, 12, 420, 49.5);
+        ctx.setTransform(1.5, 0, 0, 1.5, 0, 0);
+        spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas, {
+            viewportKey: SHEET_VIEWPORT_KEY.VIEW_MAIN_TOP,
+            viewPortPosition: position,
+        }), skeleton);
+        spreadsheet.makeDirty(false);
+        spreadsheet.makeForceDirty(false);
+
+        const refresh = vi.spyOn(spreadsheet, 'refreshCacheCanvas');
+        const paint = vi.spyOn(spreadsheet, 'paintNewAreaForScrolling');
+        ctx.setTransform(1.5, 0, 0, 1.5, -15, 0);
+        spreadsheet.renderByViewports(ctx, createViewportInfo(scene, canvas, {
+            viewportKey: SHEET_VIEWPORT_KEY.VIEW_MAIN_TOP,
+            viewPortPosition: position,
+            diffX: -10,
+            diffY: 0,
+            diffBounds: [createBound(400, 0, 420, 240)],
+            diffCacheBounds: [createBound(400, 0, 460, 280)],
+            isDirty: 0,
+            isForceDirty: false,
+            shouldCacheUpdate: 1,
+        }), skeleton);
+        expect(refresh).toHaveBeenCalledOnce();
+        expect(paint).not.toHaveBeenCalled();
     });
 
     it('prepares missing style coverage independently of the bitmap damage strips', () => {
@@ -2182,6 +2506,44 @@ describe('spreadsheet integration', () => {
         expect(paint).not.toHaveBeenCalled();
     });
 
+    it.each([
+        { axis: 'row', index: 0, size: 32, diffX: -20, diffY: 0, update: 1, full: true },
+        { axis: 'row', index: 0, size: 32, diffX: -20, diffY: 0, update: 0, full: true },
+        { axis: 'column', index: 0, size: 16, diffX: 0, diffY: -20, update: 1, full: true },
+        { axis: 'column', index: 0, size: 16, diffX: 0, diffY: -20, update: 0, full: true },
+        { axis: 'row', index: 19, size: 32, diffX: -20, diffY: 0, update: 1, full: false },
+        { axis: 'column', index: 11, size: 16, diffX: 0, diffY: -20, update: 1, full: false },
+        { axis: 'row', index: 0, size: 32, diffX: 0, diffY: -20, update: 1, full: false },
+        { axis: 'column', index: 0, size: 16, diffX: -20, diffY: 0, update: 1, full: false },
+        { axis: 'row', index: 0, size: 0, diffX: -20, diffY: 0, update: 1, full: false },
+    ])('preserves gap stripe phase on $axis scrolls (gap: $index, cache update: $update)', ({ axis, index, size, diffX, diffY, update, full }) => {
+        const { spreadsheet, skeleton, mainCanvas, viewport, scene } = fixture;
+        const cacheCanvas = viewport.canvas!;
+        cacheCanvas.setSize(700, 420, 1);
+        skeleton.setGapConfig(axis === 'row'
+            ? { rowGaps: { [index]: { size } } }
+            : { colGaps: { [index]: { size } } });
+        const info = createViewportInfo(scene, cacheCanvas, {
+            diffBounds: [diffX ? createBound(400, 0, 420, 240) : createBound(0, 220, 420, 240)],
+            diffCacheBounds: update ? [diffX ? createBound(400, 0, 460, 280) : createBound(0, 220, 460, 280)] : [],
+            diffX,
+            diffY,
+            isDirty: 0,
+            isForceDirty: false,
+            shouldCacheUpdate: update,
+        });
+        skeleton.setStylesCache(info);
+        spreadsheet.makeDirty(false);
+        spreadsheet.makeForceDirty(false);
+        const refresh = vi.spyOn(spreadsheet, 'refreshCacheCanvas');
+        const paint = vi.spyOn(spreadsheet, 'paintNewAreaForScrolling');
+
+        spreadsheet.renderByViewports(mainCanvas.getContext(), info, skeleton);
+
+        expect(refresh).toHaveBeenCalledTimes(full ? 1 : 0);
+        expect(paint).toHaveBeenCalledTimes(full ? 0 : 1);
+    });
+
     it('retains full horizontal refresh when the cache is not owned by the viewport', () => {
         const { spreadsheet, skeleton, mainCanvas, cacheCanvas, scene } = fixture;
         const context = mainCanvas.getContext();
@@ -2321,6 +2683,48 @@ describe('spreadsheet integration', () => {
             'rgba(24, 119, 242, 0.08)',
             'rgba(24, 119, 242, 0.25)'
         );
+    });
+
+    it.each([
+        { browser: 'Safari', iPhone: false, swaps: false },
+        { browser: 'Chrome', iPhone: true, swaps: false },
+        { browser: 'Chrome', iPhone: false, swaps: true },
+        { browser: 'FF', iPhone: false, swaps: true },
+    ])('preserves native text context on $browser (iPhone: $iPhone)', ({ browser, iPhone, swaps }) => {
+        const { spreadsheet, skeleton, scene, viewport, mainCanvas } = fixture;
+        const mainCtx = mainCanvas.getContext();
+        vi.spyOn(mainCtx, 'getBrowserType').mockReturnValue(browser);
+        vi.spyOn(Tools, 'isIPhone').mockReturnValue(iPhone);
+        const initialCanvas = viewport.canvas!;
+        initialCanvas.setSize(460, 280, 1);
+        let source = initialCanvas;
+
+        for (const direction of [1, -1]) {
+            const next = spreadsheet.paintNewAreaForScrolling(
+                createViewportInfo(scene, source, {
+                    diffX: direction * 4,
+                    diffY: direction * 3,
+                    diffBounds: [createBound(100, 60, 220, 140)],
+                    diffCacheBounds: [createBound(100, 60, 220, 140)],
+                }),
+                {
+                    cacheCanvas: source,
+                    cacheCtx: source.getContext(),
+                    mainCtx,
+                    topOrigin: 0,
+                    leftOrigin: 0,
+                    bufferEdgeX: 8,
+                    bufferEdgeY: 6,
+                    rowHeaderWidthAndMarginLeft: skeleton.rowHeaderWidthAndMarginLeft,
+                    columnHeaderHeightAndMarginTop: skeleton.columnHeaderHeightAndMarginTop,
+                    scaleX: 1,
+                    scaleY: 1,
+                }
+            );
+            expect(next === source).toBe(!swaps);
+            expect(viewport.canvas).toBe(next);
+            source = next;
+        }
     });
 
     it('alternates scroll buffers independently for each viewport', () => {

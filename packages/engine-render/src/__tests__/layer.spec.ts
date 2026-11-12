@@ -14,11 +14,17 @@
  * limitations under the License.
  */
 
-import type { IViewportInfo } from '../basics/vector2';
+import { Injector } from '@univerjs/core';
 import { describe, expect, it, vi } from 'vitest';
+import type { IViewportInfo } from '../basics/vector2';
 import { BaseObject } from '../base-object';
 import { RENDER_CLASS_TYPE } from '../basics/const';
+import { Engine } from '../engine';
 import { Layer } from '../layer';
+import { MAIN_VIEW_PORT_KEY, Scene } from '../scene';
+import { DumbCanvasColorService, ICanvasColorService } from '../services/canvas-color.service';
+import { Rect } from '../shape/rect';
+import { Viewport } from '../viewport';
 
 class TestObject extends BaseObject {
     constructor(id: string, zIndex = 1) {
@@ -99,6 +105,63 @@ function createCtx() {
 }
 
 describe('layer', () => {
+    it('paints a cache enabled after engine sizing and invalidates it for edits and resize', () => {
+        const injector = new Injector([
+            [ICanvasColorService, { useClass: DumbCanvasColorService }],
+            [Engine, {
+                useFactory: (container: Injector) => container.createInstance(Engine, 'cache-ready', { elementWidth: 160, elementHeight: 90, dpr: 1 }),
+                deps: [Injector],
+            }],
+            [Scene, {
+                useFactory: (container: Injector) => container.createInstance(Scene, 'cache-ready', container.get(Engine)),
+                deps: [Injector],
+            }],
+            [Layer, {
+                useFactory: (container: Injector) => container.createInstance(Layer, container.get(Scene), [], 1),
+                deps: [Injector],
+            }],
+            [Rect, {
+                useFactory: (container: Injector) => container.createInstance(Rect, 'cache-ready', { width: 20, height: 10, fill: '#123456' }),
+                deps: [Injector],
+            }],
+            [Viewport, {
+                useFactory: (container: Injector) => container.createInstance(Viewport, MAIN_VIEW_PORT_KEY, container.get(Scene), { left: 0, top: 0, width: 160, height: 90, active: true }),
+                deps: [Injector],
+            }],
+        ]);
+        const engine = injector.get(Engine);
+        const scene = injector.get(Scene);
+        const layer = injector.get(Layer);
+        const rect = injector.get(Rect);
+        injector.get(Viewport);
+        scene.transformByState({ width: 160, height: 90, scaleX: 1, scaleY: 1 });
+        scene.addLayer(layer);
+        scene.addObject(rect, 1);
+        const context = engine.getCanvas().getContext();
+        const blit = vi.spyOn(context, 'drawImage');
+        const paint = vi.spyOn(rect, 'render');
+        try {
+            layer.enableCache();
+            layer.render(context);
+            expect(blit).toHaveBeenLastCalledWith(expect.any(HTMLCanvasElement), 0, 0, 160, 90);
+            const initialPaints = paint.mock.calls.length;
+            expect(initialPaints).toBeGreaterThan(0);
+            layer.render(context);
+            expect(paint).toHaveBeenCalledTimes(initialPaints);
+
+            rect.setProps({ fill: '#654321' });
+            layer.render(context);
+            expect(paint.mock.calls.length).toBeGreaterThan(initialPaints);
+            engine.resizeBySize(240, 120);
+            layer.render(context);
+            expect(blit).toHaveBeenLastCalledWith(expect.any(HTMLCanvasElement), 0, 0, 240, 120);
+        } finally {
+            paint.mockRestore();
+            blit.mockRestore();
+            injector.dispose();
+        }
+    });
+
     it('adds, orders, filters and removes regular objects', () => {
         const scene = createScene();
         const visible = new TestObject('visible', 2);
@@ -191,7 +254,7 @@ describe('layer', () => {
 
         expect(layer.isAllowCache()).toBe(true);
         layer.render(ctx);
-        expect(ctx.drawImage).not.toHaveBeenCalled();
+        expect(ctx.drawImage).toHaveBeenCalledWith(expect.any(HTMLCanvasElement), 0, 0, 160, 90);
 
         scene.__resizeCache();
         layer.render(ctx);
